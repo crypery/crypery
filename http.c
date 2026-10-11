@@ -35,6 +35,9 @@ static const char *http_blocked_paths[] = {
 // RFC 6455 GUID appended to the Sec-WebSocket-Key during the handshake
 static const char *http_ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+// Hard safety cap for request bodies when max_body_mb is 0 (unlimited)
+#define HTTP_HARD_MAX_BODY (256 * 1024 * 1024)
+
 // SHA-1 working state (5 x 32-bit words)
 typedef struct { uint32_t h[5]; } http_sha1_ctx_t;
 
@@ -211,10 +214,13 @@ static int http_hex_val(char c) {
     return -1;
 }
 
-// Parse a decimal integer from s up to end
+// Parse a decimal integer from s up to end (saturates at INT32_MAX)
 static long long http_parse_decimal(const char *s, const char *end) {
     long long v = 0; int any = 0;
-    while (s < end && *s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; any = 1; }
+    while (s < end && *s >= '0' && *s <= '9') {
+        if (v > 0x7FFFFFFFLL / 10) return 0x7FFFFFFFLL;
+        v = v * 10 + (*s - '0'); s++; any = 1;
+    }
     return any ? v : 0;
 }
 
@@ -475,6 +481,8 @@ http_server_t *http_init() {
     memset(http->ssl_conns, 0, sizeof(http->ssl_conns));
     memset(http->ctx, 0, sizeof(http->ctx));
     memset(&http->pool, 0, sizeof(http->pool));
+    mtx_init(&http->ctx_lock);
+    http->reaper_on = 0;
 
     http->router.capacity = HTTP_MAX_ROUTES_INITIAL;
     http->router.entries = (http_route_entry_t *)calloc((size_t)http->router.capacity, sizeof(http_route_entry_t));
@@ -498,6 +506,7 @@ void http_free(http_server_t *http) {
     http_p_stop(http);
     if (http->router.entries) { free(http->router.entries); http->router.entries = NULL; }
     if (http->ssl_ctx) { SSL_CTX_free(http->ssl_ctx); http->ssl_ctx = NULL; }
+    mtx_destroy(&http->ctx_lock);
     sock_cleanup();
     free(http);
 }
@@ -576,6 +585,24 @@ static int http_sock_send_all(SOCKET fd, const char *buf, int len, int timeout_m
     return total;
 }
 
+// Apply a bounded recv/send timeout to a socket (ms; 0 = no timeout).
+// Without this a stalled client pins the worker thread forever inside
+// recv()/send() (the TLS layer calls raw blocking recv()/send()).
+static void http_sock_set_io_timeout(SOCKET s, int ms) {
+    if (ms <= 0) return;
+#ifdef _WIN32
+    int to = ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&to, sizeof(to));
+#else
+    struct timeval to;
+    to.tv_sec = ms / 1000;
+    to.tv_usec = (ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
+#endif
+}
+
 // Pool worker thread (forward declaration)
 static void *http_worker(void *p);
 // Close a connection and free its resources (forward declaration)
@@ -601,20 +628,31 @@ void http_p_start(http_server_t *http, int n, int sz) {
 void http_p_stop(http_server_t *http) {
     http_pool_t *pool = &http->pool;
     if (!pool->q) return;
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        http_ctx_t *c = http->ctx[i];
-        if (c && (int)c->fd > 0) shutdown((SOCKET)c->fd, SD_BOTH);
+    {
+        /* Unblock workers stuck in recv()/send() by shutting down every
+         * live connection. Collect fds under the ctx lock; the worker that
+         * owns a socket performs the final close/free. */
+        SOCKET dead[MAX_CLIENTS];
+        int ndead = 0;
+        mtx_lock(&http->ctx_lock);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            http_ctx_t *c = http->ctx[i];
+            if (c && (int)c->fd > 0) { c->reaped = 1; dead[ndead++] = c->fd; }
+        }
+        mtx_unlock(&http->ctx_lock);
+        for (int i = 0; i < ndead; i++) shutdown(dead[i], SD_BOTH);
     }
     for (unsigned i = 0; i < pool->nt; i++) evt_signal(&pool->ev);
     for (unsigned i = 0; i < pool->nt; i++) thr_join(&pool->th[i]);
+    if (http->reaper_on) { thr_join(&http->reaper); http->reaper_on = 0; }
     free(pool->th);
-    mtx_destroy(&pool->cs);
     mtx_lock(&pool->cs);
     while (pool->qt > pool->qh) {
         http_conn_close(http, pool->q[pool->qh % pool->qs]);
         pool->qh++;
     }
     mtx_unlock(&pool->cs);
+    mtx_destroy(&pool->cs);
     free(pool->q);
     evt_destroy(&pool->ev);
     pool->q = NULL; pool->th = NULL;
@@ -660,30 +698,38 @@ static void *http_worker(void *p) {
 
 // Allocate a connection context from the server table
 static http_ctx_t *http_ctx_alloc(http_server_t *http, SOCKET fd, int is_https) {
+    mtx_lock(&http->ctx_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!http->ctx[i]) {
             http_ctx_t *c = (http_ctx_t *)calloc(1, sizeof(http_ctx_t));
-            if (!c) return NULL;
-            c->fd = fd;
-            c->state = S_IDLE;
-            c->is_https = is_https;
-            c->timeout_io_ms = http->timeout_io_ms;
-            c->server_name = http->server_name;
-            c->domains = http->domains;
-            c->www_redirect = http->www_redirect;
-            c->connect_tick = compat_tick();
-            http->ctx[i] = c;
-            return c;
+            if (c) {
+                c->fd = fd;
+                c->state = S_IDLE;
+                c->is_https = is_https;
+                c->timeout_io_ms = http->timeout_io_ms;
+                c->server_name = http->server_name;
+                c->domains = http->domains;
+                c->www_redirect = http->www_redirect;
+                unsigned long now = compat_tick();
+                c->connect_tick = now;
+                c->last_active = now;
+                http->ctx[i] = c;
+                mtx_unlock(&http->ctx_lock);
+                return c;
+            }
         }
     }
+    mtx_unlock(&http->ctx_lock);
     return NULL;
 }
 
 // Remove a connection context from the server table
 static void http_ctx_unregister(http_server_t *http, http_ctx_t *c) {
+    mtx_lock(&http->ctx_lock);
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (http->ctx[i] == c) { http->ctx[i] = NULL; return; }
+        if (http->ctx[i] == c) { http->ctx[i] = NULL; break; }
     }
+    mtx_unlock(&http->ctx_lock);
 }
 
 // Close a connection and free its resources
@@ -703,6 +749,39 @@ static void http_conn_close(http_server_t *http, http_ctx_t *c) {
     free(c->big); c->big = NULL; c->big_cap = 0;
     http_ctx_unregister(http, c);
     free(c);
+}
+
+// Idle reaper: closes connections that stay silent too long before the full
+// request arrives (silent connects, half-finished TLS handshakes, slowloris
+// trickling). Without this a stalled client pins a worker thread forever.
+// Only shutdown() is issued here: the worker still owning the socket wakes
+// up with an I/O error and does the close/free itself - no use-after-free.
+static void *http_reaper(void *p) {
+    http_server_t *http = (http_server_t *)p;
+    SOCKET dead[128];
+    for (;;) {
+#ifdef _WIN32
+        Sleep(1000);
+#else
+        { struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL); }
+#endif
+        if (http->shutdown) break;
+        unsigned long now = compat_tick();
+        const unsigned long idle_ms = 30000; /* max silence before request is read */
+        int ndead = 0;
+        mtx_lock(&http->ctx_lock);
+        for (int i = 0; i < MAX_CLIENTS && ndead < (int)(sizeof(dead) / sizeof(dead[0])); i++) {
+            http_ctx_t *c = http->ctx[i];
+            if (c && !c->reaped && !c->req_done && (int)c->fd > 0 &&
+                now - c->last_active >= idle_ms) {
+                c->reaped = 1;
+                dead[ndead++] = c->fd;
+            }
+        }
+        mtx_unlock(&http->ctx_lock);
+        for (int i = 0; i < ndead; i++) shutdown(dead[i], SD_BOTH);
+    }
+    return NULL;
 }
 
 // Return the effective raw request buffer (dynamic or inline)
@@ -731,7 +810,8 @@ void http_send_json_response(http_server_t *http, http_ctx_t *c, int status, con
         "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
         status,
         status == 200 ? "OK" : status == 201 ? "Created" : status == 204 ? "No Content" :
-        status == 400 ? "Bad Request" : status == 404 ? "Not Found" : "Internal Server Error",
+        status == 400 ? "Bad Request" : status == 404 ? "Not Found" :
+        status == 408 ? "Request Timeout" : "Internal Server Error",
         http_srv_name(c), date_buf, (int)strlen(json_body));
     char *resp = (char *)malloc((size_t)hlen + strlen(json_body));
     memcpy(resp, hdr, (size_t)hlen);
@@ -1078,7 +1158,12 @@ void http_do_parse(http_server_t *http, http_ctx_t *c, const char *raw, size_t r
 int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
     char *raw = http_req_buf(c);
     size_t rlen = c->rlen;
-    if (rlen < sizeof(c->rb)) raw[c->rlen] = '\0';
+    {
+        /* big buffers are not NUL-terminated by the reader; terminate now,
+         * otherwise strstr() below reads past the heap allocation */
+        size_t raw_cap = c->big ? c->big_cap : sizeof(c->rb);
+        if (rlen < raw_cap) raw[c->rlen] = '\0';
+    }
     if (rlen < 4) { http_send_json_response(http, c, 400, "{\"error\":\"Invalid HTTP request\"}"); http_update_status_stats(http, 400); return 1; }
     char method[16] = {0}, uri[2048] = {0};
     {
@@ -1105,14 +1190,17 @@ int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
     if (!body_start) { http_send_json_response(http, c, 400, "{\"error\":\"Invalid HTTP request\"}"); return 1; }
     size_t header_size = (size_t)(body_start - raw);
     body_start += 4;
-    int content_length = 0;
+    long long content_length = 0;
     const char *cl = http_strcasestr_custom(raw, "Content-Length:");
     if (cl) {
         const char *cp = cl + 15;
         while (*cp == ' ' || *cp == '\t') cp++;
-        content_length = (int)http_parse_decimal(cp, raw + rlen);
+        content_length = http_parse_decimal(cp, raw + rlen);
+        if (content_length < 0) content_length = 0;
     }
     size_t body_len = (size_t)(rlen - (body_start - raw));
+    /* The body cannot be larger than what actually arrived on the wire */
+    if (content_length > (long long)body_len) content_length = (long long)body_len;
     if (body_len > (size_t)content_length) body_len = (size_t)content_length;
     int size_err = http_check_size_limits(body_len, header_size, http_max_body_bytes(http));
     if (size_err == 1) { http_send_json_response(http, c, 413, "{\"error\":\"Request body too large\"}"); http_update_status_stats(http, 413); return 1; }
@@ -1213,7 +1301,19 @@ int http_sock_read_data(http_ctx_t *c, char *buf, int len) {
 // Read a complete request (headers + Content-Length body); returns 0 when ready
 static int http_conn_read_request(http_server_t *http, http_ctx_t *c) {
     (void)http;
+    /* Total read deadline: per-chunk gaps are bounded by the socket
+     * SO_RCVTIMEO, this additionally bounds the whole assembly so a
+     * slowloris trickle cannot pin a worker forever. Assumed minimum
+     * legitimate rate: 10 KB/s of body transfer. */
+    unsigned long rd_start = compat_tick();
+    unsigned long io_eff = (unsigned)(c->timeout_io_ms > 0 ? c->timeout_io_ms : 5000);
+    unsigned long rd_deadline = rd_start + io_eff * 12 + 1000; /* headers phase */
     for (;;) {
+        if (compat_tick() >= rd_deadline) {
+            http_send_json_response(http, c, 408, "{\"error\":\"Request timeout\"}");
+            http_update_status_stats(http, 408);
+            return -1;
+        }
         char *buf = c->big ? c->big : c->rb;
         size_t cap = c->big ? c->big_cap : sizeof(c->rb);
         if (c->rlen >= cap) return -1;
@@ -1227,6 +1327,7 @@ static int http_conn_read_request(http_server_t *http, http_ctx_t *c) {
             return -1;
         }
         c->rlen += (size_t)n;
+        c->last_active = compat_tick();
 
         int hsz = -1;
         for (size_t pos = 0; pos + 3 < c->rlen; pos++) {
@@ -1256,9 +1357,22 @@ static int http_conn_read_request(http_server_t *http, http_ctx_t *c) {
                 break;
             }
         }
+        if (clen < 0) clen = 0;
+
+        /* Effective body cap: config limit, or a hard 256 MB safety cap when
+         * max_body_mb is 0 (unlimited). A lying Content-Length must not be
+         * able to force a giant allocation per connection. */
         size_t max_body = http_max_body_bytes(http);
+        if (max_body == (size_t)-1) max_body = HTTP_HARD_MAX_BODY;
+        if ((size_t)clen > max_body) {
+            http_send_json_response(http, c, 413, "{\"error\":\"Request body too large\"}");
+            http_update_status_stats(http, 413);
+            return -1;
+        }
+        rd_deadline = rd_start + io_eff * 12 + 1000 +
+                      (unsigned long)((unsigned long long)clen / 10000UL) * 1000UL;
         size_t need = (size_t)hsz + (size_t)clen;
-        if (max_body != (size_t)-1 && need > max_body + MAX_HEADER_SIZE) {
+        if (need > max_body + MAX_HEADER_SIZE) {
             http_send_json_response(http, c, 413, "{\"error\":\"Request body too large\"}");
             http_update_status_stats(http, 413);
             return -1;
@@ -1287,6 +1401,9 @@ static void http_serve_conn(http_server_t *http, http_ctx_t *c) {
         c->handshake_state = 1;
     }
     if (http_conn_read_request(http, c) != 0) { http_send_buf(http, c); return; }
+    c->req_done = 1; /* request fully read - the reaper must not touch it
+                       (the client is allowed to stay silent while it
+                       receives the response) */
     http_do_parse(http, c, c->rb, c->rlen);
     http_send_buf(http, c);
 }
@@ -1313,6 +1430,13 @@ static int http_accept_loop(http_server_t *http) {
         struct sockaddr_in sa; int slen = sizeof(sa);
         SOCKET sock = accept(http->listen_fd, (struct sockaddr *)&sa, &slen);
         if (sock == INVALID_SOCKET) continue;
+
+        /* Bound every blocking recv()/send() on this connection. The TLS
+         * layer (ssl_sock_read/ssl_sock_write) uses raw blocking I/O;
+         * without SO_RCVTIMEO/SO_SNDTIMEO a stalled client pins the worker
+         * thread forever. Half the io_timeout: ssl_sock_read() retries the
+         * timed-out recv() once, so total wait stays within io_timeout. */
+        http_sock_set_io_timeout(sock, (http->timeout_io_ms > 0) ? http->timeout_io_ms / 2 : 0);
 
         int is_tls = 0;
         if (http->ssl_use) {
@@ -1386,6 +1510,7 @@ int http_run(http_server_t *http, HttpLogFn log) {
     int qs = http->max_clients > 0 ? http->max_clients : MAX_CLIENTS;
     if (qs > MAX_CLIENTS) qs = MAX_CLIENTS;
     http_p_start(http, http->worker_threads, qs);
+    if (thr_create(&http->reaper, http_reaper, http) == 0) http->reaper_on = 1;
     http_accept_loop(http);
     return 0;
 }

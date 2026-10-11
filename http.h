@@ -270,6 +270,9 @@ struct http_ctx{
     int    bad_record_count;         // Count of malformed TLS records
     int    timeout_io_ms;            // Per-socket I/O timeout (0 = none)
     unsigned long connect_tick;      // Accept timestamp
+    unsigned long last_active;       // Last client data tick (idle reaper)
+    int    req_done;                 // 1 when full request is read (reaper off)
+    int    reaped;                   // Reaper already requested close
     const char *server_name;          // Server header value (default nginx/1.25.2)
     const char *domains;              // Comma-separated allowed Host domains
     int www_redirect;                 // 1 = 301 redirect www. -> bare domain (default), 0 = off
@@ -392,6 +395,9 @@ struct http_server{
     SSL_CTX *ssl_ctx;                // TLS context
     http_ssl_conn_t ssl_conns[HTTP_MAX_SSL_CONNS];  // Legacy TLS buffers
     http_ctx_t *ctx[MAX_CLIENTS];    // Connection table
+    mtx_t ctx_lock;                  // Protects ctx[] (accept/reaper/workers)
+    thr_t reaper;                    // Idle-reaper thread handle
+    int reaper_on;                   // Reaper thread is running
     http_pool_t pool;                // Worker pool
     long total_req;                  // Total requests
     long status_2xx;                 // 2xx responses
