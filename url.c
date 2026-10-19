@@ -36,9 +36,11 @@
 #include "tls.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -58,6 +60,7 @@
 #include <fcntl.h>
 #include <strings.h>
 #include <time.h>
+#include <pthread.h>
 #endif
 
 // ---- portability shims: Winsock on Windows, BSD sockets on POSIX ----
@@ -79,6 +82,12 @@
 #define SD_BOTH        SHUT_RDWR
 #define _stricmp       strcasecmp
 #define _strnicmp      strncasecmp
+#endif
+
+#ifdef _WIN32
+#define x_strdup _strdup
+#else
+#define x_strdup strdup
 #endif
 
 #ifndef INVALID_SOCKET
@@ -369,6 +378,72 @@ void url_decode(char *s) {
     *r = '\0';
 }
 
+void url_normalize_path(const char *path, char *out, size_t outlen) {
+    char tmp[URL_MAX_PATH + 512];
+    char tailbuf[URL_MAX_PATH];
+    const char *seg[256];
+    size_t seglen[256];
+    int n = 0, absolute, i;
+    size_t o = 0, tl;
+    const char *p;
+
+    if (!path) {
+        if (outlen) out[0] = '\0';
+        return;
+    }
+    tailbuf[0] = '\0';
+    tl = strlen(path);
+    if (tl >= sizeof(tmp)) tl = sizeof(tmp) - 1;
+    memcpy(tmp, path, tl);
+    tmp[tl] = '\0';
+
+    /* split off query / fragment */
+    {
+        char *q = strpbrk(tmp, "?#");
+        if (q) {
+            size_t ql = strlen(q);
+            if (ql >= sizeof(tailbuf)) ql = sizeof(tailbuf) - 1;
+            memcpy(tailbuf, q, ql);
+            tailbuf[ql] = '\0';
+            *q = '\0';
+        }
+    }
+    absolute = (tmp[0] == '/');
+    p = tmp;
+    while (*p) {
+        const char *e;
+        size_t l;
+        while (*p == '/') p++;
+        if (!*p) break;
+        e = p;
+        while (*e && *e != '/') e++;
+        l = (size_t)(e - p);
+        if (l == 1 && p[0] == '.') {
+            /* current directory: drop */
+        } else if (l == 2 && p[0] == '.' && p[1] == '.') {
+            if (n > 0) n--;
+        } else if (n < 256) {
+            seg[n] = p;
+            seglen[n] = l;
+            n++;
+        }
+        p = e;
+    }
+    if (absolute && o + 1 < outlen) out[o++] = '/';
+    for (i = 0; i < n; i++) {
+        if (i > 0 && o + 1 < outlen) out[o++] = '/';
+        if (o + seglen[i] < outlen) {
+            memcpy(out + o, seg[i], seglen[i]);
+            o += seglen[i];
+        }
+    }
+    if (outlen == 0) return;
+    if (o >= outlen) o = outlen - 1;
+    out[o] = '\0';
+    if (tailbuf[0] && o + 1 < outlen)
+        strncat(out, tailbuf, outlen - o - 1);
+}
+
 void url_join(const char *base, const char *loc, char *out, size_t outlen) {
     if (_strnicmp(loc, "https://", 8) == 0 || _strnicmp(loc, "http://", 7) == 0) {
         u_strcpyz(out, outlen, loc);
@@ -394,10 +469,12 @@ void url_join(const char *base, const char *loc, char *out, size_t outlen) {
         return;
     }
     if (loc[0] == '/') {
+        char norm[URL_MAX_PATH];
+        url_normalize_path(loc, norm, sizeof(norm));
         u_strcpyz(out, outlen, scheme);
         u_strcat(out, outlen, "://");
         u_strcat(out, outlen, auth);
-        u_strcat(out, outlen, loc);
+        u_strcat(out, outlen, norm);
         return;
     }
 
@@ -411,11 +488,16 @@ void url_join(const char *base, const char *loc, char *out, size_t outlen) {
     } else {
         strcpy(dir, "/");
     }
-    u_strcpyz(out, outlen, scheme);
-    u_strcat(out, outlen, "://");
-    u_strcat(out, outlen, auth);
-    u_strcat(out, outlen, dir);
-    u_strcat(out, outlen, loc);
+    {
+        char raw[URL_MAX_PATH * 2];
+        char norm[URL_MAX_PATH];
+        snprintf(raw, sizeof(raw), "%s%s", dir, loc);
+        url_normalize_path(raw, norm, sizeof(norm));
+        u_strcpyz(out, outlen, scheme);
+        u_strcat(out, outlen, "://");
+        u_strcat(out, outlen, auth);
+        u_strcat(out, outlen, norm);
+    }
 }
 
 // Extract filename from Content-Disposition header
@@ -702,6 +784,354 @@ int url_multipart_build(const char *forms[], int n, char **out, size_t *outlen,
     return 0;
 }
 
+// ============================ Cookie jar ============================
+// One process-wide cookie list shared by every UrlCtx. Entries are matched
+// per RFC 6265 basics: domain suffix (or exact host for host-only cookies),
+// path prefix, Secure only over TLS, expiry by epoch seconds (0 = session).
+// File format (tab separated, one cookie per line):
+//   domain<TAB>path<TAB>name<TAB>value<TAB>secure<TAB>expires
+
+// One stored cookie
+typedef struct {
+    char domain[256];
+    char path[512];
+    char name[128];
+    char value[1024];
+    int secure;
+    int host_only;
+    long long expires; // epoch seconds; 0 = session
+} cookie_t;
+
+// Shared cookie list and its capacity
+static cookie_t *g_cookies = NULL;
+static int g_count = 0, g_cap = 0;
+// 1 once the shared list has been loaded from a file (url_cookie_load)
+static int g_cookie_loaded = 0;
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_cookie_lock;
+static int g_cookie_lock_init = 0;
+static void cookie_lock(void) {
+    if (!g_cookie_lock_init) { InitializeCriticalSection(&g_cookie_lock); g_cookie_lock_init = 1; }
+    EnterCriticalSection(&g_cookie_lock);
+}
+static void cookie_unlock(void) { LeaveCriticalSection(&g_cookie_lock); }
+#else
+static pthread_mutex_t g_cookie_lock = PTHREAD_MUTEX_INITIALIZER;
+static void cookie_lock(void)   { pthread_mutex_lock(&g_cookie_lock); }
+static void cookie_unlock(void) { pthread_mutex_unlock(&g_cookie_lock); }
+#endif
+
+// Lowercase a string in place
+static void cookie_lower(char *s) {
+    for (; *s; s++)
+        *s = (char)tolower((unsigned char)*s);
+}
+
+// Split "scheme://host[:port]/path" into lowercased host and path
+static void cookie_split_url(const char *url, char *host, size_t hsz, char *path, size_t psz, int *is_ssl) {
+    const char *p = strstr(url, "://");
+    const char *h;
+    host[0] = 0;
+    path[0] = '/';
+    path[1] = 0;
+    *is_ssl = 0;
+    if (!p) return;
+    *is_ssl = (p - url == 5 && _strnicmp(url, "https", 5) == 0);
+    h = p + 3;
+    {
+        size_t i = 0;
+        while (*h && *h != '/' && *h != '?' && *h != '#' && i + 1 < hsz) {
+            if (*h == ':') { // port: skip to the path
+                while (*h && *h != '/') h++;
+                break;
+            }
+            host[i++] = *h++;
+        }
+        host[i] = 0;
+        cookie_lower(host);
+    }
+    if (*h == '/') {
+        size_t i = 0;
+        while (*h && *h != '?' && *h != '#' && i + 1 < psz)
+            path[i++] = *h++;
+        path[i] = 0;
+    }
+}
+
+// Default cookie path = directory of the request path
+static void cookie_default_path(const char *req_path, char *out, size_t osz) {
+    const char *slash = strrchr(req_path, '/');
+    if (!slash || slash == req_path) {
+        snprintf(out, osz, "/");
+        return;
+    }
+    {
+        size_t l = (size_t)(slash - req_path) + 1;
+        if (l >= osz) l = osz - 1;
+        memcpy(out, req_path, l);
+        out[l] = 0;
+    }
+}
+
+// Map "Jan".."Dec" (case-insensitive) to 0..11, or -1
+static int cookie_month_num(const char *m) {
+    static const char *mo[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                               "Jul","Aug","Sep","Oct","Nov","Dec"};
+    int i;
+    for (i = 0; i < 12; i++)
+        if (_strnicmp(m, mo[i], 3) == 0) return i;
+    return -1;
+}
+
+// Parse "Wdy, DD Mon YYYY HH:MM:SS GMT" into epoch seconds (approx)
+static long long cookie_parse_date(const char *s) {
+    int day = 0, mon = -1, yr = 0, hh = 0, mm = 0, ss = 0;
+    const char *p = s;
+    while (*p && !isdigit((unsigned char)*p)) p++;
+    if (sscanf(p, "%d", &day) != 1) return -1;
+    while (*p && !isalpha((unsigned char)*p)) p++;
+    if ((mon = cookie_month_num(p)) < 0) return -1;
+    while (*p && !isdigit((unsigned char)*p)) p++;
+    if (sscanf(p, "%d", &yr) != 1) return -1;
+    while (*p && *p != ':') p++; // skip to time
+    if (*p == ':') { p++; sscanf(p, "%d:%d", &hh, &mm); }
+    while (*p && *p != ':') p++;
+    if (*p == ':') { p++; sscanf(p, "%d", &ss); }
+    {
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        tm.tm_mday = day; tm.tm_mon = mon; tm.tm_year = yr - 1900;
+        tm.tm_hour = hh; tm.tm_min = mm; tm.tm_sec = ss;
+        return (long long)mktime(&tm);
+    }
+}
+
+// Insert or update a cookie; an expired one removes the existing match
+static void cookie_store(cookie_t c) {
+    int i;
+    long long now = (long long)time(NULL);
+    if (c.expires != 0 && c.expires <= now) {
+        for (i = 0; i < g_count; i++) {
+            if (strcmp(g_cookies[i].domain, c.domain) == 0 &&
+                strcmp(g_cookies[i].path, c.path) == 0 &&
+                strcmp(g_cookies[i].name, c.name) == 0) {
+                g_cookies[i] = g_cookies[g_count - 1];
+                g_count--;
+                return;
+            }
+        }
+        return;
+    }
+    for (i = 0; i < g_count; i++) {
+        if (strcmp(g_cookies[i].domain, c.domain) == 0 &&
+            strcmp(g_cookies[i].path, c.path) == 0 &&
+            strcmp(g_cookies[i].name, c.name) == 0) {
+            g_cookies[i] = c;
+            return;
+        }
+    }
+    if (g_count == g_cap) {
+        int nc = g_cap ? g_cap * 2 : 64;
+        cookie_t *nv = (cookie_t *)realloc(g_cookies, (size_t)nc * sizeof(cookie_t));
+        if (!nv) return;
+        g_cookies = nv;
+        g_cap = nc;
+    }
+    g_cookies[g_count++] = c;
+}
+
+void url_cookie_set_from_url(const char *url, const char *set_cookie) {
+    char host[256], path[512];
+    int is_ssl;
+    cookie_t c;
+    const char *p, *end;
+
+    if (!url || !set_cookie || !set_cookie[0]) return;
+    memset(&c, 0, sizeof(c));
+    cookie_split_url(url, host, sizeof(host), path, sizeof(path), &is_ssl);
+    if (!host[0]) return;
+
+    // name=value
+    p = set_cookie;
+    while (*p == ' ') p++;
+    end = strchr(p, '=');
+    if (!end) return;
+    {
+        size_t l = (size_t)(end - p);
+        if (l >= sizeof(c.name)) l = sizeof(c.name) - 1;
+        memcpy(c.name, p, l);
+        c.name[l] = 0;
+    }
+    p = end + 1;
+    end = strchr(p, ';');
+    {
+        size_t l = end ? (size_t)(end - p) : strlen(p);
+        if (l >= sizeof(c.value)) l = sizeof(c.value) - 1;
+        memcpy(c.value, p, l);
+        c.value[l] = 0;
+    }
+
+    snprintf(c.domain, sizeof(c.domain), "%s", host);
+    c.host_only = 1;
+    cookie_default_path(path, c.path, sizeof(c.path));
+    c.expires = 0;
+    c.secure = is_ssl ? 0 : 0;
+
+    // attributes
+    while (end) {
+        const char *a;
+        p = end + 1;
+        while (*p == ' ') p++;
+        end = strchr(p, ';');
+        {
+            size_t l = end ? (size_t)(end - p) : strlen(p);
+            char attr[512];
+            if (l >= sizeof(attr)) l = sizeof(attr) - 1;
+            memcpy(attr, p, l);
+            attr[l] = 0;
+            a = attr;
+            while (*a == ' ') a++;
+            if (_strnicmp(a, "domain=", 7) == 0) {
+                char d[256];
+                snprintf(d, sizeof(d), "%s", a + 7);
+                while (*d == ' ') memmove(d, d + 1, strlen(d));
+                { size_t dl = strlen(d); while (dl && (d[dl-1]==' ')) d[--dl]=0; }
+                if (d[0] == '.') memmove(d, d + 1, strlen(d));
+                cookie_lower(d);
+                if (d[0]) {
+                    snprintf(c.domain, sizeof(c.domain), "%s", d);
+                    c.host_only = 0;
+                }
+            } else if (_strnicmp(a, "path=", 5) == 0) {
+                char pp[512];
+                snprintf(pp, sizeof(pp), "%s", a + 5);
+                { size_t pl = strlen(pp); while (pl && pp[pl-1]==' ') pp[--pl]=0; }
+                if (pp[0] == '/')
+                    snprintf(c.path, sizeof(c.path), "%s", pp);
+            } else if (_strnicmp(a, "secure", 6) == 0) {
+                c.secure = 1;
+            } else if (_strnicmp(a, "max-age=", 8) == 0) {
+                long long ma = atoll(a + 8);
+                c.expires = (long long)time(NULL) + ma;
+            } else if (_strnicmp(a, "expires=", 8) == 0) {
+                long long e = cookie_parse_date(a + 8);
+                if (e > 0 && c.expires == 0) c.expires = e;
+            }
+        }
+        if (!end) break;
+    }
+
+    cookie_lock();
+    cookie_store(c);
+    cookie_unlock();
+}
+
+// 1 if the cookie domain matches the request host
+static int cookie_domain_match(const cookie_t *c, const char *host) {
+    size_t dl = strlen(c->domain), hl = strlen(host);
+    if (hl == dl && _stricmp(host, c->domain) == 0) return 1;
+    if (!c->host_only && hl > dl && host[hl - dl - 1] == '.' &&
+        _stricmp(host + hl - dl, c->domain) == 0)
+        return 1;
+    return 0;
+}
+
+char *url_cookie_header_for(const char *url) {
+    char host[256], path[512], out[8192];
+    int is_ssl;
+    size_t o = 0;
+    int i;
+    long long now = (long long)time(NULL);
+
+    if (!url) return NULL;
+    cookie_split_url(url, host, sizeof(host), path, sizeof(path), &is_ssl);
+    if (!host[0]) return NULL;
+    out[0] = 0;
+
+    cookie_lock();
+    for (i = 0; i < g_count; i++) {
+        cookie_t *c = &g_cookies[i];
+        size_t pl;
+        if (c->expires != 0 && c->expires <= now) continue;
+        if (c->secure && !is_ssl) continue;
+        if (!cookie_domain_match(c, host)) continue;
+        pl = strlen(c->path);
+        if (pl && strncmp(path, c->path, pl) != 0) continue;
+        {
+            char part[1200];
+            snprintf(part, sizeof(part), "%s%s=%s", o ? "; " : "", c->name, c->value);
+            if (o + strlen(part) + 1 >= sizeof(out)) break;
+            memcpy(out + o, part, strlen(part) + 1);
+            o += strlen(part);
+        }
+    }
+    cookie_unlock();
+    if (o == 0) return NULL;
+    return x_strdup(out);
+}
+
+void url_cookie_load(const char *file) {
+    FILE *f;
+    char line[2400];
+    if (!file) return;
+    cookie_lock();
+    f = fopen(file, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            cookie_t c;
+            char *t1, *t2, *t3, *t4, *t5;
+            size_t l = strlen(line);
+            while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+            if (!line[0] || line[0] == '#') continue;
+            memset(&c, 0, sizeof(c));
+            t1 = strchr(line, '\t');
+            if (!t1) continue;
+            *t1++ = 0;
+            t2 = strchr(t1, '\t'); if (!t2) continue; *t2++ = 0;
+            t3 = strchr(t2, '\t'); if (!t3) continue; *t3++ = 0;
+            t4 = strchr(t3, '\t'); if (!t4) continue; *t4++ = 0;
+            t5 = strchr(t4, '\t'); if (!t5) continue; *t5++ = 0;
+            snprintf(c.domain, sizeof(c.domain), "%s", line);
+            snprintf(c.path, sizeof(c.path), "%s", t1);
+            snprintf(c.name, sizeof(c.name), "%s", t2);
+            snprintf(c.value, sizeof(c.value), "%s", t3);
+            c.secure = atoi(t4);
+            c.expires = atoll(t5);
+            c.host_only = 1;
+            if (g_count == g_cap) {
+                int nc = g_cap ? g_cap * 2 : 64;
+                cookie_t *nv = (cookie_t *)realloc(g_cookies, (size_t)nc * sizeof(cookie_t));
+                if (!nv) break;
+                g_cookies = nv;
+                g_cap = nc;
+            }
+            g_cookies[g_count++] = c;
+        }
+        fclose(f);
+    }
+    cookie_unlock();
+}
+
+void url_cookie_save(const char *file) {
+    FILE *f;
+    int i;
+    long long now = (long long)time(NULL);
+    if (!file) return;
+    cookie_lock();
+    f = fopen(file, "w");
+    if (f) {
+        for (i = 0; i < g_count; i++) {
+            cookie_t *c = &g_cookies[i];
+            if (c->expires != 0 && c->expires <= now) continue;
+            fprintf(f, "%s\t%s\t%s\t%s\t%d\t%lld\n", c->domain, c->path,
+                    c->name, c->value, c->secure, c->expires);
+        }
+        fclose(f);
+    }
+    cookie_unlock();
+}
+
 // Build HTTP request string with headers
 char *url_build_request(const UrlCtx *ctx, const UrlInfo *u, const char *method,
                         const char *content_type, const char *range,
@@ -734,6 +1164,20 @@ char *url_build_request(const UrlCtx *ctx, const UrlInfo *u, const char *method,
     }
     if (range) url_header_add(&L, "Range", range);
     url_header_add(&L, "Connection", "close");
+
+    /* attach stored cookies for this URL (shared jar, if enabled) */
+    if (ctx->use_cook && strcmp(method, "GET") == 0) {
+        char curl[URL_MAX_PATH * 2 + 128];
+        snprintf(curl, sizeof(curl), "%s://%s%s", u->is_ssl ? "https" : "http",
+                 u->host, u->path);
+        {
+            char *ck = url_cookie_header_for(curl);
+            if (ck) {
+                url_header_add(&L, "Cookie", ck);
+                free(ck);
+            }
+        }
+    }
 
     for (int i = 0; i < ctx->headers.n; i++)
         url_header_add(&L, ctx->headers.h[i].name, ctx->headers.h[i].value);
@@ -1207,6 +1651,12 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
     char current_url[URL_MAX_PATH * 2 + 128];
     u_strcpyz(current_url, sizeof(current_url), url);
 
+    /* load the shared cookie jar from the file once, if this context uses one */
+    if (ctx->use_cook && !g_cookie_loaded && ctx->cook_file) {
+        url_cookie_load(ctx->cook_file);
+        g_cookie_loaded = 1;
+    }
+
     int redirs = 0;
     int failed = 0;
     int use_body = (ctx->data != NULL && ctx->data_len > 0);
@@ -1313,6 +1763,19 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
         if (ctx->verbose) verbose_response(log, &rh);
         ctx->last_status = rh.status;
         ctx->last_head = rh;
+
+        /* store any Set-Cookie headers for later requests (shared jar) */
+        if (ctx->use_cook) {
+            int ck_changed = 0;
+            for (int hi = 0; hi < rh.headers.n; hi++) {
+                if (_stricmp(rh.headers.h[hi].name, "set-cookie") == 0) {
+                    url_cookie_set_from_url(current_url, rh.headers.h[hi].value);
+                    ck_changed = 1;
+                }
+            }
+            if (ck_changed && ctx->cook_file)
+                url_cookie_save(ctx->cook_file);
+        }
 
         int is_head = (strcmp(method, "HEAD") == 0);
         StrBuf body_buf;

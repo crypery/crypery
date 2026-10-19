@@ -83,6 +83,7 @@ A self-contained HTTP/HTTPS client library built on the built-in TLS stack:
 - response reading: status line, headers, body by Content-Length, chunked transfer encoding, or until EOF;
 - redirect handling (301/302/303/307/308) with RFC 7231 method semantics and a redirect count limit;
 - multipart/form-data body building (fields and files, boundary generation, MIME detection by extension);
+- cookie jar: one in-memory list shared by every `UrlCtx` with optional persistence to a file (`ctx->use_cook` / `ctx->cook_file`); RFC 6265-style matching (Domain/Path, Secure over TLS only, Max-Age/Expires), automatic `Set-Cookie` storage and `Cookie` sending on GET;
 - transport layer: DNS resolution, connection with timeout, TLS handshake (SNI, option to skip certificate verification), buffered I/O;
 - error codes compatible with curl conventions;
 - optional verbose logging via a callback (disabled by `URL_NO_LOG`).
@@ -193,12 +194,17 @@ int main(void)
 {
     http_server_t *http = http_init();
     http->port = 443;
-    http->root = "www";
     http->ssl_use = true;
     http->cert_file = "localhost.crt";
     http->key_file = "localhost.key";
 
-    http_route(http, "GET", "/api/info", handle_info);
+    /* per-domain document roots; hosts not listed are rejected (400) */
+    http_domain(http, "localhost", "www");
+    http_domain(http, "127.0.0.1", "www");
+    http_domain(http, "test.localhost", "test");
+
+    /* routes are domain-scoped: registered only for "localhost" */
+    http_route(http, "localhost", "GET", "/api/info", handle_info);
 
     http_run(http, my_log_cb);   /* NULL - disable module logging */
     http_free(http);
@@ -206,7 +212,7 @@ int main(void)
 }
 ```
 
-Requests to paths without registered routes are automatically served by static file serving from `http->root`.
+Requests to paths without registered routes are automatically served by static file serving from the document root of the request's `Host` domain (see `http_domain()`); when no domains are configured every host is served from the built-in default root `DEF_ROOT` (`www`). Routes are registered per domain: `http_route(http, domain, method, path, handler)` applies only to that domain, or to every domain when the domain argument is `NULL`.
 
 ### url
 
@@ -233,6 +239,39 @@ if (data) {
 }
 url_free(ctx);
 ```
+
+Cookies (shared jar):
+
+```c
+#include "url.h"
+
+UrlCtx *ctx = url_init();
+
+/* Enable the cookie jar. Cookies are kept in one shared in-memory list and,
+ * because cook_file is set, loaded from "cookies.txt" on the first url_run()
+ * (if the file exists) and saved back to it on every Set-Cookie - so the next
+ * application run starts with the saved cookies.
+ * ctx->cook_file = NULL would keep the list in memory only. */
+ctx->use_cook  = true;
+ctx->cook_file = "cookies.txt";
+
+char *data = url_run(ctx, "https://example.com/login", "GET", NULL);
+if (data) {
+    /* The server answered with "Set-Cookie: sid=abc; Path=/" - the cookie
+     * is now stored in the shared jar and written to cookies.txt. */
+    free(data);
+}
+
+/* The next request automatically carries "Cookie: sid=abc" (GET only) */
+data = url_run(ctx, "https://example.com/profile", "GET", NULL);
+if (data) {
+    printf("%s", data);
+    free(data);
+}
+url_free(ctx);
+```
+
+The jar is a single list shared by every `UrlCtx`; entries are matched per RFC 6265 basics (Domain/Path attributes, Secure only over TLS, Max-Age/Expires). `url_cookie_header_for()`, `url_cookie_set_from_url()`, `url_cookie_load()` and `url_cookie_save()` are available for direct access to the list.
 
 ## License
 

@@ -83,6 +83,7 @@
 - 读取响应：状态行、请求头、按 Content-Length、chunked transfer encoding 或直到 EOF 读取响应体；
 - 重定向处理（301/302/303/307/308），遵循 RFC 7231 的方法语义，并限制跳转次数；
 - 构建 multipart/form-data 请求体（字段和文件、boundary 生成、按扩展名识别 MIME）；
+- Cookie 存储：所有 `UrlCtx` 共享一个内存 Cookie 列表，可选持久化到文件（`ctx->use_cook` / `ctx->cook_file`）；按 RFC 6265 规则匹配（Domain/Path、Secure 仅限 TLS、Max-Age/Expires），自动存储 `Set-Cookie` 并在 GET 请求中发送 `Cookie`；
 - 传输层：DNS 解析、带超时的连接、TLS 握手（SNI、可选跳过证书校验）、缓冲读写；
 - 与 curl 约定兼容的错误码；
 - 可选的详细日志回调（可通过 `URL_NO_LOG` 关闭）。
@@ -193,12 +194,17 @@ int main(void)
 {
     http_server_t *http = http_init();
     http->port = 443;
-    http->root = "www";
     http->ssl_use = true;
     http->cert_file = "localhost.crt";
     http->key_file = "localhost.key";
 
-    http_route(http, "GET", "/api/info", handle_info);
+    /* 按域名设置根目录；未列出的主机将被拒绝（400） */
+    http_domain(http, "localhost", "www");
+    http_domain(http, "127.0.0.1", "www");
+    http_domain(http, "test.localhost", "test");
+
+    /* 路由按域绑定：仅注册到 "localhost" */
+    http_route(http, "localhost", "GET", "/api/info", handle_info);
 
     http_run(http, my_log_cb);   /* NULL - 关闭模块日志 */
     http_free(http);
@@ -206,7 +212,7 @@ int main(void)
 }
 ```
 
-对未注册路由的路径的请求，会自动由 `http->root` 下的静态文件分发处理。
+对未注册路由的路径的请求，会自动由请求 `Host` 域对应的根目录下的静态文件分发处理（见 `http_domain()`）；未配置任何域时则所有主机都使用内置的默认根目录 `DEF_ROOT`（`www`）。路由按域单独注册：`http_route(http, domain, method, path, handler)` 仅对该域生效，`domain` 传 `NULL` 时对所有域生效。
 
 ### url
 
@@ -233,6 +239,39 @@ if (data) {
 }
 url_free(ctx);
 ```
+
+Cookie（共享存储）：
+
+```c
+#include "url.h"
+
+UrlCtx *ctx = url_init();
+
+/* 启用 Cookie 存储。Cookie 保存在所有 UrlCtx 共享的内存列表中；
+ * 因为设置了 cook_file，首次 url_run() 时若 "cookies.txt" 存在则从中
+ * 加载，每次收到 Set-Cookie 后列表都会写回该文件——下次启动应用时
+ * 从文件恢复 Cookie。
+ * ctx->cook_file = NULL 表示仅保存在内存中。 */
+ctx->use_cook  = true;
+ctx->cook_file = "cookies.txt";
+
+char *data = url_run(ctx, "https://example.com/login", "GET", NULL);
+if (data) {
+    /* 服务器返回 "Set-Cookie: sid=abc; Path=/" —— Cookie 已存入
+     * 共享列表并写入 cookies.txt。 */
+    free(data);
+}
+
+/* 后续请求会自动带上 "Cookie: sid=abc" 请求头（仅 GET） */
+data = url_run(ctx, "https://example.com/profile", "GET", NULL);
+if (data) {
+    printf("%s", data);
+    free(data);
+}
+url_free(ctx);
+```
+
+Cookie 存储是所有 `UrlCtx` 共享的单一列表，匹配遵循 RFC 6265 基本规则（Domain/Path 属性、Secure 仅限 TLS、Max-Age/Expires）。`url_cookie_header_for()`、`url_cookie_set_from_url()`、`url_cookie_load()`、`url_cookie_save()` 可直接操作该列表。
 
 ## License
 

@@ -14,7 +14,8 @@
  * Example:
  *   http_server_t *http = http_init();
  *   http->port = 443;
- *   http_route(http, "GET", "/api/info", handle_info);
+ *   http_domain(http, "localhost", "www");
+ *   http_route(http, "localhost", "GET", "/api/info", handle_info);
  *   http_run(http, my_log_cb);   pass NULL to silence module logging
  *   http_free(http);
  */
@@ -60,49 +61,38 @@ static const char *http_srv_name(const http_ctx_t *c) {
 static void resp_send(http_ctx_t *c, const void *data, size_t len);
 static void http_date_gmt(char *buf, size_t n);
 
-/* Check whether a Host header value matches one of the comma-separated allowed
- * domains. Ports and surrounding whitespace are ignored; comparison is
- * case-insensitive. */
-static int http_host_allowed(const char *host, size_t hlen, const char *domains) {
-    char hb[512];
-    size_t n = hlen < sizeof(hb) - 1 ? hlen : sizeof(hb) - 1;
-    memcpy(hb, host, n); hb[n] = '\0';
-    char *hs = hb;
-    while (*hs == ' ' || *hs == '\t') hs++;
-    if (hs != hb) memmove(hb, hs, strlen(hs) + 1);
-    char *colon = strchr(hb, ':'); if (colon) *colon = '\0';
-    char *he = hb + strlen(hb);
-    while (he > hb && (he[-1] == ' ' || he[-1] == '\t')) he--;
+/* Normalize a Host header value: strip surrounding whitespace and an optional
+ * :port suffix, lowercase the result. Writes into out (NUL-terminated) and
+ * returns the normalized length (0 = empty/invalid). */
+static size_t http_norm_host(const char *host, size_t hlen, char *out, size_t out_sz) {
+    if (!host || out_sz == 0) return 0;
+    size_t n = hlen < out_sz - 1 ? hlen : out_sz - 1;
+    memcpy(out, host, n); out[n] = '\0';
+    char *s = out;
+    while (*s == ' ' || *s == '\t') s++;
+    if (s != out) memmove(out, s, strlen(s) + 1);
+    char *colon = strchr(out, ':');
+    if (colon) *colon = '\0';
+    char *he = out + strlen(out);
+    while (he > out && (he[-1] == ' ' || he[-1] == '\t')) he--;
     *he = '\0';
-
-    char dl[2048];
-    snprintf(dl, sizeof(dl), "%s", domains ? domains : "");
-    char *save = NULL;
-    for (char *tok = strtok_s(dl, ",", &save); tok; tok = strtok_s(NULL, ",", &save)) {
-        char *t = tok;
-        while (*t == ' ' || *t == '\t') t++;
-        char *e = t + strlen(t);
-        while (e > t && (e[-1] == ' ' || e[-1] == '\t')) e--;
-        if ((size_t)(e - t) == strlen(hb) && _strnicmp(t, hb, strlen(hb)) == 0) return 1;
+    for (char *p = out; *p; p++) {
+        if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
     }
-    return 0;
+    return strlen(out);
 }
 
-/* Validate the request Host header against the configured domain list.
- * Returns 1 when the host is allowed or no Host header is present, 0 when
- * the request must be rejected. */
-static int http_check_host(http_ctx_t *c) {
-    const char *r = http_req_buf(c);
-    size_t rl = c->rlen;
-    for (size_t i = 0; i + 5 <= rl; i++) {
-        if (_strnicmp(r + i, "Host:", 5) == 0) {
-            const char *hv = r + i + 5;
-            size_t hl = 0;
-            while (hv + hl < r + rl && hv[hl] != '\r' && hv[hl] != '\n') hl++;
-            return http_host_allowed(hv, hl, c->domains);
-        }
+/* Check whether a Host header value matches one of the configured domains.
+ * Ports and surrounding whitespace are ignored; comparison is case-insensitive.
+ * When no domains are configured every host is allowed. */
+static int http_host_allowed(const http_server_t *http, const char *host, size_t hlen) {
+    if (!http || http->domain_count == 0) return 1;
+    char hb[512];
+    if (http_norm_host(host, hlen, hb, sizeof(hb)) == 0) return 0;
+    for (int i = 0; i < http->domain_count; i++) {
+        if (strcmp(http->domains[i].domain, hb) == 0) return 1;
     }
-    return 1;
+    return 0;
 }
 
 /* Find the Host header value. Searches only the header block (before the
@@ -131,13 +121,25 @@ static int http_find_host(const char *r, size_t rl, const char **hv_out, size_t 
     return 0;
 }
 
+/* Validate the request Host header against the configured domain table.
+ * Returns 1 when the host is allowed or no Host header is present, 0 when
+ * the request must be rejected. */
+static int http_check_host(const http_server_t *http, http_ctx_t *c) {
+    const char *r = http_req_buf(c);
+    size_t rl = c->rlen;
+    const char *hv = NULL;
+    size_t hl = 0;
+    if (http_find_host(r, rl, &hv, &hl)) return http_host_allowed(http, hv, hl);
+    return 1;
+}
+
 /* Send a "301 Moved Permanently" redirect from www. host to the bare domain.
  * Returns 1 when a redirect was sent (caller must stop processing), else 0.
  * Keeps the original scheme (http/https), port (if present) and request URI:
  *   http://www.localhost:81/a?b=c  -> http://localhost:81/a?b=c
  *   https://www.localhost/a         -> https://localhost/a
  * Redirect applies only when www_redirect is enabled and the bare domain
- * (Host without the "www." prefix) is in the allowed "domains" list. */
+ * (Host without the "www." prefix) is a configured domain. */
 static int http_handle_www_redirect(http_server_t *http, http_ctx_t *c, const char *uri) {
     int enabled = c ? c->www_redirect : (http ? http->www_redirect : DEF_WWW_REDIRECT);
     if (!enabled) return 0;
@@ -173,8 +175,8 @@ static int http_handle_www_redirect(http_server_t *http, http_ctx_t *c, const ch
     if (_strnicmp(hb, "www.", 4) != 0) return 0;
     const char *bare = hb + 4;
     if (bare[0] == '\0') return 0;
-    /* Redirect only when the bare domain itself is allowed. */
-    if (!http_host_allowed(bare, strlen(bare), c->domains)) return 0;
+    /* Redirect only when the bare domain itself is configured. */
+    if (!http_host_allowed(http, bare, strlen(bare))) return 0;
 
     const char *scheme = c->is_https ? "https" : "http";
     const char *path = (uri[0] == '\0') ? "/" : uri;
@@ -458,13 +460,14 @@ http_server_t *http_init() {
     http->max_body_mb = DEF_MAX_BODY_MB;
     http->log_output = HTTP_LOG_OUTPUT_CONSOLE;
     http->log_level = HTTP_LOG_LEVEL_INFO;
-    http->root = DEF_ROOT;
     http->upload_dir = DEF_UPLOAD_DIR;
     http->cert_file = DEF_CERT_FILE;
     http->key_file = DEF_KEY_FILE;
     http->log_file = DEF_LOG_FILE;
     http->server_name = DEF_SERVER_NAME;
-    http->domains = DEF_DOMAINS;
+    http->domains = NULL;
+    http->domain_count = 0;
+    http->domain_capacity = 0;
     http->www_redirect = DEF_WWW_REDIRECT;
 
     http->listen_fd = INVALID_SOCKET;
@@ -504,18 +507,37 @@ void http_free(http_server_t *http) {
     if (http->log_fn) http->log_fn(HTTP_LOG_LEVEL_INFO, "[shutdown] HTTP server stopped\n");
 #endif
     http_p_stop(http);
-    if (http->router.entries) { free(http->router.entries); http->router.entries = NULL; }
+    if (http->router.entries) {
+        for (int i = 0; i < http->router.count; i++) free(http->router.entries[i].domain);
+        free(http->router.entries); http->router.entries = NULL;
+    }
+    if (http->domains) {
+        for (int i = 0; i < http->domain_count; i++) { free(http->domains[i].domain); free(http->domains[i].root); }
+        free(http->domains); http->domains = NULL;
+    }
+    http->domain_count = 0; http->domain_capacity = 0;
     if (http->ssl_ctx) { SSL_CTX_free(http->ssl_ctx); http->ssl_ctx = NULL; }
     mtx_destroy(&http->ctx_lock);
     sock_cleanup();
     free(http);
 }
 
-// Register a route handler for method+path
-void http_route(http_server_t *http, const char *method, const char *path,
+// Portable string duplication
+static char *http_strdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = (char *)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+// Register a route handler for domain+method+path
+void http_route(http_server_t *http, const char *domain, const char *method, const char *path,
                 int (*handler)(http_server_t *http, http_ctx_t *c, const char *method, const char *uri,
                                const char *body, size_t body_len)) {
     if (!http || !handler) return;
+    char nb[512];
+    int have_dom = (domain && domain[0]) ? (int)http_norm_host(domain, strlen(domain), nb, sizeof(nb)) : 0;
     if (http->router.count >= http->router.capacity) {
         int new_cap = (http->router.capacity > 0) ? http->router.capacity * 2 : HTTP_MAX_ROUTES_INITIAL;
         if (new_cap > HTTP_MAX_ROUTES) new_cap = HTTP_MAX_ROUTES;
@@ -525,10 +547,67 @@ void http_route(http_server_t *http, const char *method, const char *path,
         http->router.entries = new_entries;
         http->router.capacity = new_cap;
     }
-    http->router.entries[http->router.count].method = method;
-    http->router.entries[http->router.count].path = path;
-    http->router.entries[http->router.count].handler = handler;
+    http_route_entry_t *e = &http->router.entries[http->router.count];
+    e->domain = have_dom ? http_strdup(nb) : NULL;
+    if (have_dom && !e->domain) return;
+    e->method = method;
+    e->path = path;
+    e->handler = handler;
     http->router.count++;
+}
+
+// Add a domain -> document-root mapping
+int http_domain(http_server_t *http, const char *domain, const char *root) {
+    if (!http || !domain || !domain[0]) return -1;
+    if (http->domain_count >= http->domain_capacity) {
+        int nc = (http->domain_capacity > 0) ? http->domain_capacity * 2 : HTTP_MAX_DOMAINS_INITIAL;
+        if (nc > HTTP_MAX_DOMAINS) nc = HTTP_MAX_DOMAINS;
+        if (http->domain_count >= nc) return -1;
+        http_domain_t *nd = (http_domain_t *)realloc(http->domains, (size_t)nc * sizeof(http_domain_t));
+        if (!nd) return -1;
+        memset((char *)nd + (size_t)http->domain_count * sizeof(http_domain_t), 0,
+               (size_t)(nc - http->domain_count) * sizeof(http_domain_t));
+        http->domains = nd;
+        http->domain_capacity = nc;
+    }
+    char nb[512];
+    if (http_norm_host(domain, strlen(domain), nb, sizeof(nb)) == 0) return -1;
+    const char *eff_root = (root && root[0]) ? root : DEF_ROOT;
+    http_domain_t *e = &http->domains[http->domain_count];
+    e->domain = http_strdup(nb);
+    e->root = http_strdup(eff_root);
+    if (!e->domain || !e->root) {
+        free(e->domain); free(e->root);
+        e->domain = NULL; e->root = NULL;
+        return -1;
+    }
+    http->domain_count++;
+    return 0;
+}
+
+// Find the configured domain entry for a Host header value
+static const http_domain_t *http_find_domain(const http_server_t *http, const char *host, size_t hlen) {
+    if (!http || http->domain_count == 0) return NULL;
+    char hb[512];
+    if (http_norm_host(host, hlen, hb, sizeof(hb)) == 0) return NULL;
+    for (int i = 0; i < http->domain_count; i++) {
+        if (strcmp(http->domains[i].domain, hb) == 0) return &http->domains[i];
+    }
+    return NULL;
+}
+
+// Resolve the document root for a Host header value
+const char *http_domain_root(const http_server_t *http, const char *host, size_t hlen) {
+    const http_domain_t *d = http_find_domain(http, host, hlen);
+    return d ? d->root : NULL;
+}
+
+// Effective document root for a connection: per-request value first, then the
+// compile-time default.
+static const char *http_doc_root(const http_server_t *http, const http_ctx_t *c) {
+    (void)http;
+    if (c && c->doc_root && c->doc_root[0]) return c->doc_root;
+    return DEF_ROOT;
 }
 
 // Non-blocking readiness check for a socket
@@ -708,7 +787,8 @@ static http_ctx_t *http_ctx_alloc(http_server_t *http, SOCKET fd, int is_https) 
                 c->is_https = is_https;
                 c->timeout_io_ms = http->timeout_io_ms;
                 c->server_name = http->server_name;
-                c->domains = http->domains;
+                c->domain = NULL;
+                c->doc_root = NULL;
                 c->www_redirect = http->www_redirect;
                 unsigned long now = compat_tick();
                 c->connect_tick = now;
@@ -799,64 +879,164 @@ static void resp_send(http_ctx_t *c, const void *data, size_t len) {
     }
 }
 
+/* Build and send a complete response: status line, Server/Date, Content-Type,
+ * Content-Length, then any handler-queued headers (Set-Cookie), then the body.
+ * The queued headers are consumed (cleared) after the send. */
+static void http_send_response(http_ctx_t *c, int status, const char *content_type,
+                               const char *body, size_t body_len) {
+    if (!c) return;
+    char date_buf[128];
+    http_date_gmt(date_buf, sizeof(date_buf));
+    const char *reason =
+        status == 200 ? "OK" : status == 201 ? "Created" : status == 204 ? "No Content" :
+        status == 400 ? "Bad Request" : status == 404 ? "Not Found" :
+        status == 408 ? "Request Timeout" : status == 413 ? "Payload Too Large" :
+        status == 414 ? "URI Too Long" : status == 431 ? "Header Too Large" : "Internal Server Error";
+    size_t cookie_len = c->resp_hdrs_len > 0 ? c->resp_hdrs_len : 0;
+    size_t hdr_cap = 512 + cookie_len + 32;
+    char *hdr = (char *)malloc(hdr_cap);
+    if (!hdr) return;
+    int hlen = snprintf(hdr, hdr_cap,
+        "HTTP/1.1 %d %s\r\nServer: %s\r\nDate: %s\r\n"
+        "Content-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n",
+        status, reason, http_srv_name(c), date_buf, content_type, (int)body_len);
+    if (hlen < 0 || (size_t)hlen >= hdr_cap) { free(hdr); return; }
+    if (cookie_len) { memcpy(hdr + hlen, c->resp_hdrs, cookie_len); hlen += (int)cookie_len; }
+    memcpy(hdr + hlen, "\r\n", 2); hlen += 2;
+    char *resp = (char *)malloc((size_t)hlen + body_len);
+    if (!resp) { free(hdr); return; }
+    memcpy(resp, hdr, (size_t)hlen);
+    if (body_len) memcpy(resp + hlen, body, body_len);
+    resp_send(c, resp, (size_t)hlen + body_len);
+    free(resp);
+    free(hdr);
+    c->resp_hdrs_len = 0; /* queued headers are consumed with this response */
+}
+
 // Send JSON HTTP response
 void http_send_json_response(http_server_t *http, http_ctx_t *c, int status, const char *json_body) {
     (void)http;
-    char date_buf[128];
-    http_date_gmt(date_buf, sizeof(date_buf));
-    char hdr[512];
-    int hlen = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\nServer: %s\r\nDate: %s\r\n"
-        "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-        status,
-        status == 200 ? "OK" : status == 201 ? "Created" : status == 204 ? "No Content" :
-        status == 400 ? "Bad Request" : status == 404 ? "Not Found" :
-        status == 408 ? "Request Timeout" : "Internal Server Error",
-        http_srv_name(c), date_buf, (int)strlen(json_body));
-    char *resp = (char *)malloc((size_t)hlen + strlen(json_body));
-    memcpy(resp, hdr, (size_t)hlen);
-    memcpy(resp + hlen, json_body, strlen(json_body));
-    resp_send(c, resp, (size_t)(hlen + (int)strlen(json_body)));
-    free(resp);
+    http_send_response(c, status, "application/json", json_body, json_body ? strlen(json_body) : 0);
 }
 
 // Send text HTTP response
 void http_send_text_response(http_server_t *http, http_ctx_t *c, int status, const char *text) {
     (void)http;
-    char date_buf[128];
-    http_date_gmt(date_buf, sizeof(date_buf));
-    char hdr[512];
-    int hlen = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\nServer: %s\r\nDate: %s\r\n"
-        "Content-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-        status,
-        status == 200 ? "OK" : status == 201 ? "Created" :
-        status == 400 ? "Bad Request" : status == 404 ? "Not Found" : "Internal Server Error",
-        http_srv_name(c), date_buf, (int)strlen(text));
-    char *resp = (char *)malloc((size_t)hlen + strlen(text));
-    memcpy(resp, hdr, (size_t)hlen);
-    memcpy(resp + hlen, text, strlen(text));
-    resp_send(c, resp, (size_t)(hlen + (int)strlen(text)));
-    free(resp);
+    http_send_response(c, status, "text/html; charset=utf-8", text, text ? strlen(text) : 0);
 }
 
 // Send HTML HTTP response
 void http_send_html_response(http_server_t *http, http_ctx_t *c, int status, const char *html) {
     (void)http;
-    char date_buf[128];
-    http_date_gmt(date_buf, sizeof(date_buf));
-    char hdr[512];
-    int hlen = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 %d %s\r\nServer: %s\r\nDate: %s\r\n"
-        "Content-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-        status,
-        status == 200 ? "OK" : status == 400 ? "Bad Request" : "Internal Server Error",
-        http_srv_name(c), date_buf, (int)strlen(html));
-    char *resp = (char *)malloc((size_t)hlen + strlen(html));
-    memcpy(resp, hdr, (size_t)hlen);
-    memcpy(resp + hlen, html, strlen(html));
-    resp_send(c, resp, (size_t)(hlen + (int)strlen(html)));
-    free(resp);
+    http_send_response(c, status, "text/html; charset=utf-8", html, html ? strlen(html) : 0);
+}
+
+/* ============================ Cookies ============================ */
+
+// Find the end of the header block (the blank line) in a raw request
+static size_t http_hdr_end(const char *r, size_t rl) {
+    size_t hend = rl;
+    for (size_t i = 0; i + 3 < rl; i++) {
+        if (r[i] == '\r' && r[i + 1] == '\n' && r[i + 2] == '\r' && r[i + 3] == '\n') { hend = i; break; }
+        if (r[i] == '\n' && r[i + 1] == '\n') { hend = i; break; }
+    }
+    return hend;
+}
+
+/* Read a cookie value from the request Cookie header. The value is copied
+ * into the connection scratch buffer (c->cookie_val) so the returned pointer
+ * is NUL-terminated and stays valid for the life of the request. */
+const char *http_get_cookie(http_ctx_t *c, const char *name) {
+    if (!c || !name || !name[0]) return NULL;
+    const char *r = http_req_buf(c);
+    size_t rl = c->rlen;
+    if (!r || rl == 0) return NULL;
+    size_t hend = http_hdr_end(r, rl);
+    size_t nl = strlen(name);
+    for (size_t i = 0; i + 7 <= hend; i++) {
+        int at_line = (i == 0) || (r[i - 1] == '\n');
+        if (!at_line) continue;
+        size_t j = i;
+        while (j < hend && (r[j] == ' ' || r[j] == '\t')) j++;
+        if (j + 7 > hend || _strnicmp(r + j, "Cookie:", 7) != 0) continue;
+        /* Found the Cookie header: scan "name=value" pairs split by ';' */
+        const char *v = r + j + 7;
+        size_t ve = 0;
+        while (v + ve < r + hend && v[ve] != '\r' && v[ve] != '\n') ve++;
+        size_t s = 0;
+        while (s <= ve) {
+            size_t e = s;
+            while (e < ve && v[e] != ';') e++;
+            size_t p = s, q = e;
+            while (p < e && (v[p] == ' ' || v[p] == '\t')) p++;
+            while (q > p && (v[q - 1] == ' ' || v[q - 1] == '\t')) q--;
+            if (q > p && (size_t)(q - p) >= nl) {
+                const char *eq = memchr(v + p, '=', (size_t)(q - p));
+                if (eq && (size_t)(eq - (v + p)) == nl && strncmp(v + p, name, nl) == 0) {
+                    size_t vlen = (size_t)(q - (eq - v)) - 1; /* skip the '=' */
+                    if (vlen >= sizeof(c->cookie_val)) vlen = sizeof(c->cookie_val) - 1;
+                    memcpy(c->cookie_val, eq + 1, vlen);
+                    c->cookie_val[vlen] = '\0';
+                    return c->cookie_val;
+                }
+            }
+            if (e >= ve) break;
+            s = e + 1;
+        }
+        return NULL; /* header present but the cookie is not */
+    }
+    return NULL;
+}
+
+/* Add or update a cookie in the response. Queues a Set-Cookie header line
+ * (with the given attributes) into c->resp_hdrs; it is attached to the next
+ * http_send_*_response() call on this connection. */
+int http_set_cookie(http_server_t *http, http_ctx_t *c, const char *name, const char *value,
+                    const char *path, long max_age, int secure, int http_only) {
+    (void)http;
+    if (!c || !name || !name[0] || !value) return -1;
+    size_t nl = strlen(name);
+    if (nl >= 128) return -1;
+    for (size_t i = 0; i < nl; i++) {
+        char ch = name[i];
+        if (ch == '=' || ch == ';' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') return -1;
+    }
+    size_t vl = strlen(value);
+    if (vl >= 1024) return -1;
+    for (size_t i = 0; i < vl; i++) {
+        char ch = value[i];
+        if (ch == ';' || ch == '\r' || ch == '\n') return -1;
+    }
+    const char *p_use = (path && path[0]) ? path : "/";
+    if (strlen(p_use) >= 512) return -1;
+
+    char line[2048];
+    int n;
+    int llen = snprintf(line, sizeof(line), "Set-Cookie: %s=%s; Path=%s", name, value, p_use);
+    if (llen < 0 || (size_t)llen >= sizeof(line)) return -1;
+    if (max_age > 0) {
+        n = snprintf(line + llen, sizeof(line) - (size_t)llen, "; Max-Age=%ld", max_age);
+        if (n < 0 || (size_t)(llen + n) >= sizeof(line)) return -1;
+        llen += n;
+    }
+    if (secure) {
+        n = snprintf(line + llen, sizeof(line) - (size_t)llen, "; Secure");
+        if (n < 0 || (size_t)(llen + n) >= sizeof(line)) return -1;
+        llen += n;
+    }
+    if (http_only) {
+        n = snprintf(line + llen, sizeof(line) - (size_t)llen, "; HttpOnly");
+        if (n < 0 || (size_t)(llen + n) >= sizeof(line)) return -1;
+        llen += n;
+    }
+    n = snprintf(line + llen, sizeof(line) - (size_t)llen, "\r\n");
+    if (n < 0 || (size_t)(llen + n) >= sizeof(line)) return -1;
+    llen += n;
+
+    if (c->resp_hdrs_len + (size_t)llen + 1 > sizeof(c->resp_hdrs)) return -1;
+    memcpy(c->resp_hdrs + c->resp_hdrs_len, line, (size_t)llen + 1);
+    c->resp_hdrs_len += (size_t)llen;
+    return 0;
 }
 
 // Append chunked-encoded data to write buffer
@@ -894,7 +1074,7 @@ static void http_sfile_gz(http_server_t *http, http_ctx_t *c, const char *rel, c
     (void)hdr_len;
     if (!http_client_accepts_gzip(raw_hdr, hdr_len)) return;
     char gz_path[2048];
-    int gz_name_len = snprintf(gz_path, sizeof(gz_path), "%s%s.gz", http->root, rel);
+    int gz_name_len = snprintf(gz_path, sizeof(gz_path), "%s%s.gz", http_doc_root(http, c), rel);
     if (gz_name_len < 0 || gz_name_len >= (int)sizeof(gz_path)) return;
     FILE *f = fopen(gz_path, "rb");
     if (!f) return;
@@ -925,7 +1105,7 @@ static void http_sfile_gzip_compress(http_server_t *http, http_ctx_t *c, const c
     (void)hdr_len;
     if (!http_client_accepts_gzip(raw_hdr, hdr_len)) return;
     char path[2048];
-    snprintf(path, sizeof(path), "%s%s", http->root, rel);
+    snprintf(path, sizeof(path), "%s%s", http_doc_root(http, c), rel);
     FILE *f = fopen(path, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END);
@@ -977,7 +1157,7 @@ void http_sfile(http_server_t *http, http_ctx_t *c, const char *rel) {
         if (strstr((char *)c->wb, "Content-Encoding: gzip")) return;
     }
 #endif
-    char path[2048]; snprintf(path, sizeof(path), "%s%s", http->root, rel);
+    char path[2048]; snprintf(path, sizeof(path), "%s%s", http_doc_root(http, c), rel);
     FILE *f = fopen(path, "rb");
     if (!f) {
         char h[512]; int hl = snprintf(h, sizeof(h),
@@ -1141,6 +1321,7 @@ void http_send_buf(http_server_t *http, http_ctx_t *c) {
 void http_do_parse(http_server_t *http, http_ctx_t *c, const char *raw, size_t rlen) {
     if (!http) return;
     http->total_req++;
+    if (c) { c->resp_hdrs_len = 0; c->resp_hdrs[0] = '\0'; } /* fresh cookies per request */
     if (raw != c->rb && rlen < sizeof(c->rb)) { memcpy(c->rb, raw, rlen); c->rlen = rlen; }
     else if (raw != c->rb) {
         if (!c->big || c->big_cap < rlen + 1) {
@@ -1185,7 +1366,17 @@ int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
     if (strlen(uri) > MAX_URI_LENGTH) { http_send_json_response(http, c, 414, "{\"error\":\"URI too long\"}"); return 1; }
     if (http_check_path_traversal(uri)) { http_send_json_response(http, c, 400, "{\"error\":\"Path traversal detected\"}"); http_update_status_stats(http, 400); return 1; }
     if (http_handle_www_redirect(http, c, uri)) return 1;
-    if (!http_check_host(c)) { http_send_json_response(http, c, 400, "{\"error\":\"Invalid Host header\"}"); http_update_status_stats(http, 400); return 1; }
+    if (!http_check_host(http, c)) { http_send_json_response(http, c, 400, "{\"error\":\"Invalid Host header\"}"); http_update_status_stats(http, 400); return 1; }
+    /* Resolve the request domain: its entry (for per-domain routes) and
+     * document root (NULL = default root). */
+    {
+        const char *hv = NULL;
+        size_t hl = 0;
+        c->domain = NULL;
+        c->doc_root = NULL;
+        if (http_find_host(raw, rlen, &hv, &hl)) c->domain = http_find_domain(http, hv, hl);
+        if (c->domain) c->doc_root = c->domain->root;
+    }
     const char *body_start = http_memmem(raw, rlen, "\r\n\r\n", 4);
     if (!body_start) { http_send_json_response(http, c, 400, "{\"error\":\"Invalid HTTP request\"}"); return 1; }
     size_t header_size = (size_t)(body_start - raw);
@@ -1213,6 +1404,11 @@ int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
     if (http->router.count > 0) {
         for (int i = 0; i < http->router.count; i++) {
             const http_route_entry_t *e = &http->router.entries[i];
+            /* domain-scoped routes match only their own domain; routes
+             * registered without a domain match every domain */
+            if (e->domain != NULL) {
+                if (!c->domain || strcmp(e->domain, c->domain->domain) != 0) continue;
+            }
             if (!http_method_matches(e->method, method)) continue;
             if (strcmp(e->path, clean_path) == 0) { e->handler(http, c, method, uri, (char *)body_start, body_len); return 1; }
         }
@@ -1221,7 +1417,7 @@ int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
     size_t plen = strlen(clean_path);
     if (plen > 0 && clean_path[plen - 1] == '/') snprintf(rel, sizeof(rel), "%sindex.html", clean_path);
     else snprintf(rel, sizeof(rel), "%s", clean_path);
-    char path[2048]; snprintf(path, sizeof(path), "%s%s", http->root, rel);
+    char path[2048]; snprintf(path, sizeof(path), "%s%s", http_doc_root(http, c), rel);
     FILE *f = fopen(path, "rb");
     if (!f) {
         char h[512]; int hl = snprintf(h, sizeof(h),
@@ -1506,6 +1702,10 @@ int http_run(http_server_t *http, HttpLogFn log) {
     }
 #ifndef HTTP_NO_LOG
     if (http->log_fn) http->log_fn(HTTP_LOG_LEVEL_INFO, "[listen] port=%d\n", http->port);
+    for (int i = 0; i < http->domain_count; i++) {
+        if (http->log_fn) http->log_fn(HTTP_LOG_LEVEL_INFO, "[domain] %s -> %s\n",
+                                       http->domains[i].domain, http->domains[i].root);
+    }
 #endif
     int qs = http->max_clients > 0 ? http->max_clients : MAX_CLIENTS;
     if (qs > MAX_CLIENTS) qs = MAX_CLIENTS;

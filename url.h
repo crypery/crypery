@@ -32,6 +32,7 @@
 #define URL_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /* C++ linkage guard: allow these headers to be included from C++ code so the
@@ -127,6 +128,10 @@ typedef struct {
     int include_headers;        // 1 = returned data includes the response head
     long connect_timeout_ms;    // -1 if unset
     int connect_timeout_set;
+    bool use_cook;              // 1 = use the shared cookie jar for requests
+    char *cook_file;            // cookie jar file; NULL = memory only. When set,
+                                // the jar is loaded from it on the first url_run()
+                                // and saved back on every jar change.
 
     // --- results of the last url_run() ---
     int last_status;            // HTTP status, 0 if no response
@@ -143,7 +148,7 @@ typedef struct {
  * redirects NOT followed (follow_redirects = 0), max_redirs = URL_MAX_REDIRS,
  * no console logging (verbose = 0, silent = 0), TLS verification on
  * (insecure = 0), response head excluded (include_headers = 0), connect
- * timeout unset.
+ * timeout unset, cookie jar disabled (use_cook = false, cook_file = NULL).
  *
  * @return Pointer to a new UrlCtx on success, NULL on allocation failure.
  *         The context must be freed with url_free().
@@ -295,6 +300,10 @@ int url_parse(const char *url, UrlInfo *u);
  */
 void url_join(const char *base, const char *loc, char *out, size_t outlen);
 
+/* Normalize a URL path: collapse "." and ".." segments (query/fragment kept
+ * intact).  `path` may be "/a/../b?q" or "a/./b". */
+void url_normalize_path(const char *path, char *out, size_t outlen);
+
 /* URL-decode a string in place.
  *
  * Replaces every %XX escape with the corresponding byte; leaves all other
@@ -303,6 +312,44 @@ void url_join(const char *base, const char *loc, char *out, size_t outlen);
  * @param s NUL-terminated string to decode in place; must not be NULL.
  */
 void url_decode(char *s);
+
+// ============================ Cookie jar ============================
+// The cookie jar is a single process-wide list shared by every UrlCtx.
+// Enable it per context with ctx->use_cook; when ctx->cook_file is not NULL
+// the jar is loaded from that file on the first url_run() and saved back to
+// it whenever the list changes (so a new application run picks the list up
+// from the file). With ctx->cook_file == NULL the jar lives in memory only.
+
+/* Parse one "Set-Cookie" header value received for `url` and store it in
+ * the shared cookie jar (adding, updating or removing the entry, e.g. when
+ * it expires). RFC 6265 basics: name=value, Domain, Path, Secure,
+ * Max-Age, Expires.
+ *
+ * @param url        Request URL the header was received for.
+ * @param set_cookie Raw Set-Cookie header value.
+ */
+void url_cookie_set_from_url(const char *url, const char *set_cookie);
+
+/* Build the "Cookie:" header value for `url` from the shared jar.
+ *
+ * @param url Request URL to match against (host, path, scheme).
+ * @return malloc'ed string (free with free()), or NULL if no cookie applies.
+ */
+char *url_cookie_header_for(const char *url);
+
+/* Load the shared cookie jar from `file` (tab-separated lines:
+ * domain, path, name, value, secure, expires). A missing or malformed file
+ * leaves the current list untouched.
+ *
+ * @param file File name; if NULL the call does nothing.
+ */
+void url_cookie_load(const char *file);
+
+/* Save the shared cookie jar to `file` (expired entries are dropped).
+ *
+ * @param file File name; if NULL the call does nothing.
+ */
+void url_cookie_save(const char *file);
 
 /* Determine the remote file name.
  *

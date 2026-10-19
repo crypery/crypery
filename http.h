@@ -206,7 +206,6 @@ static inline void evt_destroy(evt_t *e) {
 #define DEF_LOG_FILE "server.log"
 #define DEF_UPLOAD_DIR "www/upload"
 #define DEF_SERVER_NAME "nginx/1.25.2"
-#define DEF_DOMAINS "localhost,127.0.0.1"
 #define DEF_WWW_REDIRECT 1
 
 // Timeouts in milliseconds (0 = no timeout)
@@ -231,12 +230,20 @@ static inline void evt_destroy(evt_t *e) {
 // Capacity limits
 #define HTTP_MAX_ROUTES 64
 #define HTTP_MAX_ROUTES_INITIAL 16
+#define HTTP_MAX_DOMAINS 64
+#define HTTP_MAX_DOMAINS_INITIAL 8
 #define HTTP_MAX_QUERY_INITIAL 8
 #define HTTP_MAX_MPART_INITIAL 8
 #define HTTP_MAX_SSL_CONNS 128
 
 typedef struct http_server http_server_t;
 typedef struct http_ctx http_ctx_t;
+
+// Domain -> document-root mapping (config "domains" object: "host" -> "root path")
+typedef struct {
+    char *domain;                    // Allowed host (lowercased, port stripped)
+    char *root;                      // Document root served for this host
+} http_domain_t;
 
 /* Logging callback installed via http_run(). Called by the http module for
  * every log message unless HTTP_NO_LOG is defined at compile time. If the
@@ -274,9 +281,12 @@ struct http_ctx{
     int    req_done;                 // 1 when full request is read (reaper off)
     int    reaped;                   // Reaper already requested close
     const char *server_name;          // Server header value (default nginx/1.25.2)
-    const char *domains;              // Comma-separated allowed Host domains
+    const http_domain_t *domain;      // Matched domain entry (NULL when the Host matched none)
+    const char *doc_root;             // Document root resolved for this request (domains table) or NULL for default
     int www_redirect;                 // 1 = 301 redirect www. -> bare domain (default), 0 = off
     void  *_ssl;                     // TLS object (SSL*) or NULL
+    char  resp_hdrs[2048]; size_t resp_hdrs_len; // Handler-queued response headers (Set-Cookie lines), sent with the next http_send_*_response()
+    char  cookie_val[1024];          // Scratch for http_get_cookie() results (per connection)
 };
 
 /* Return the effective raw request buffer (dynamic or inline).
@@ -320,8 +330,9 @@ typedef struct {
     int capacity;                 // Allocated slots
 } http_query_string_t;
 
-// Registered route: method+path dispatched to a handler
+// Registered route: domain+method+path dispatched to a handler
 typedef struct {
+    char *domain;       // Domain the route belongs to (normalized); NULL = every domain
     const char *method;   // HTTP method; "" or NULL matches any
     const char *path;     // Request path
     int (*handler)(http_server_t *http, http_ctx_t *c, const char *method, const char *uri,
@@ -368,7 +379,6 @@ typedef struct {
 // HTTP server instance
 struct http_server{
     int port;                        // Listening port
-    const char *root;                // Document root
     const char *upload_dir;          // Directory for /api/upload files
     bool ssl_use;                    // Enable TLS
     int max_clients;                 // Max simultaneous connections
@@ -385,7 +395,9 @@ struct http_server{
     int log_output;                  // LogOutput destination
     int log_level;                   // LogLevel threshold
     const char *server_name;         // Server header value (default nginx/1.25.2)
-    const char *domains;             // Comma-separated allowed Host domains
+    http_domain_t *domains;          // Domain -> root table (heap)
+    int domain_count;                // Number of configured domains (0 = any host allowed)
+    int domain_capacity;             // Allocated domain slots
     int www_redirect;                // 1 = 301 redirect www. -> bare domain (default), 0 = off
     http_router_t router;            // Registered routes
     HttpLogFn log_fn;                // Logging callback (http_run) or NULL
@@ -415,14 +427,34 @@ http_server_t *http_init();
  * @param http Server to release. */
 void http_free(http_server_t *http);
 
-/* Register a route handler for an HTTP method and path.
+/* Register a route handler for a domain, an HTTP method and a path.
  * @param http Server instance.
+ * @param domain Domain the route belongs to (e.g. "localhost"); NULL or ""
+ *               registers the route for every domain.
  * @param method HTTP method, or "" for any.
  * @param path Request path to match.
  * @param handler Callback invoked for matching requests. */
-void http_route(http_server_t *http, const char *method, const char *path,
+void http_route(http_server_t *http, const char *domain, const char *method, const char *path,
                 int (*handler)(http_server_t *http, http_ctx_t *c, const char *method, const char *uri,
                                const char *body, size_t body_len));
+
+/* Add a domain -> document-root mapping. When at least one domain is
+ * configured, requests whose Host header matches no domain are rejected
+ * with 400. Call it once per config.json domain, before http_run().
+ * @param http Server instance.
+ * @param domain Host name (e.g. "localhost"); port/whitespace are stripped,
+ *               comparison is case-insensitive.
+ * @param root Document root for this domain; NULL or empty falls back to
+ *             DEF_ROOT ("www").
+ * @return 0 on success, -1 on failure (bad args / table full / allocation). */
+int http_domain(http_server_t *http, const char *domain, const char *root);
+
+/* Resolve the document root for a Host header value.
+ * @param http Server instance.
+ * @param host Host value (may include whitespace and an optional :port).
+ * @param hlen Host length.
+ * @return The configured root for that host, or NULL when not configured. */
+const char *http_domain_root(const http_server_t *http, const char *host, size_t hlen);
 
 /* Start the server: listen, spawn the thread pool, run the accept loop.
  * @param http Server instance.
@@ -643,6 +675,35 @@ void http_send_text_response(http_server_t *http, http_ctx_t *c, int status, con
  * @param status HTTP status code.
  * @param html Body HTML. */
 void http_send_html_response(http_server_t *http, http_ctx_t *c, int status, const char *html);
+
+/* ============================ Cookies ============================
+ * Cookie helpers for route handlers. Reading inspects the request Cookie
+ * header; writing queues Set-Cookie headers that are attached to the next
+ * http_send_*_response() call on the same connection. */
+
+/* Read a cookie from the request Cookie header.
+ * @param c Connection context.
+ * @param name Cookie name (case-sensitive).
+ * @return Cookie value copied into the connection scratch buffer, or NULL
+ *         when the request has no such cookie. Valid until the next call to
+ *         this function on the same connection. */
+const char *http_get_cookie(http_ctx_t *c, const char *name);
+
+/* Add or update a cookie in the response: queues "Set-Cookie: name=value;
+ * Path=..." with optional attributes, sent with the next
+ * http_send_*_response() call on the same connection. Call it in a handler
+ * before the response is sent.
+ * @param http Server instance.
+ * @param c Connection context.
+ * @param name Cookie name; must not contain '=', ';', spaces or line breaks.
+ * @param value Cookie value; must not contain ';', '\r' or '\n'.
+ * @param path Cookie Path attribute; NULL or "" means "/".
+ * @param max_age Max-Age in seconds; > 0 adds the attribute, 0 = session cookie.
+ * @param secure 1 adds the Secure attribute.
+ * @param http_only 1 adds the HttpOnly attribute.
+ * @return 0 on success, -1 on invalid arguments or when no header fits. */
+int http_set_cookie(http_server_t *http, http_ctx_t *c, const char *name, const char *value,
+                    const char *path, long max_age, int secure, int http_only);
 
 /* Extract the Content-Type value from raw request headers.
  * @param raw_hdr Raw request headers.

@@ -83,6 +83,7 @@ OpenSSL-совместимый API-слой над встроенной реал
 - чтение ответа: статус-строка, заголовки, тело по Content-Length, chunked transfer encoding или до EOF;
 - обработка редиректов (301/302/303/307/308) с семантикой методов по RFC 7231 и ограничением числа переходов;
 - сборка multipart/form-data тел (поля и файлы, генерация boundary, определение MIME по расширению);
+- хранилище куков: один общий список в памяти на все `UrlCtx` с опциональным сохранением в файл (`ctx->use_cook` / `ctx->cook_file`); сопоставление по правилам RFC 6265 (Domain/Path, Secure только по TLS, Max-Age/Expires), автоматическое сохранение `Set-Cookie` и отправка `Cookie` при GET;
 - транспортный слой: DNS-резолвинг, подключение с таймаутом, TLS-рукопожатие (SNI, опция пропуска проверки сертификата), буферизованный ввод-вывод;
 - коды ошибок, совместимые с конвенциями curl;
 - опциональное подробное логирование через колбэк (отключается `URL_NO_LOG`).
@@ -193,12 +194,17 @@ int main(void)
 {
     http_server_t *http = http_init();
     http->port = 443;
-    http->root = "www";
     http->ssl_use = true;
     http->cert_file = "localhost.crt";
     http->key_file = "localhost.key";
 
-    http_route(http, "GET", "/api/info", handle_info);
+    /* корневые каталоги по доменам; хосты вне списка отклоняются (400) */
+    http_domain(http, "localhost", "www");
+    http_domain(http, "127.0.0.1", "www");
+    http_domain(http, "test.localhost", "test");
+
+    /* маршруты привязаны к домену: зарегистрирован только для "localhost" */
+    http_route(http, "localhost", "GET", "/api/info", handle_info);
 
     http_run(http, my_log_cb);   /* NULL - отключить логирование модуля */
     http_free(http);
@@ -206,7 +212,7 @@ int main(void)
 }
 ```
 
-Запросы к путям без зарегистрированных маршрутов автоматически обслуживаются раздачей статических файлов из `http->root`.
+Запросы к путям без зарегистрированных маршрутов автоматически обслуживаются раздачей статических файлов из корневого каталога домена запроса `Host` (см. `http_domain()`), а при отсутствии настроенных доменов - все хосты обслуживаются из встроенного корня по умолчанию `DEF_ROOT` (`www`). Маршруты регистрируются отдельно для каждого домена: `http_route(http, domain, method, path, handler)` действует только для этого домена, а при `domain = NULL` - для всех доменов.
 
 ### url
 
@@ -233,6 +239,39 @@ if (data) {
 }
 url_free(ctx);
 ```
+
+Куки (общее хранилище):
+
+```c
+#include "url.h"
+
+UrlCtx *ctx = url_init();
+
+/* Включаем хранилище куков. Куки хранятся в одном общем списке в памяти и,
+ * так как задан cook_file, при первом url_run() загружаются из "cookies.txt"
+ * (если файл существует), а при каждом Set-Cookie снова записываются в него -
+ * при следующем запуске приложения куки подхватываются из файла.
+ * ctx->cook_file = NULL означает хранение только в памяти. */
+ctx->use_cook  = true;
+ctx->cook_file = "cookies.txt";
+
+char *data = url_run(ctx, "https://example.com/login", "GET", NULL);
+if (data) {
+    /* Сервер ответил "Set-Cookie: sid=abc; Path=/" - кука сохранена
+     * в общем списке и записана в cookies.txt. */
+    free(data);
+}
+
+/* Следующий запрос автоматически уйдёт с заголовком "Cookie: sid=abc" (GET) */
+data = url_run(ctx, "https://example.com/profile", "GET", NULL);
+if (data) {
+    printf("%s", data);
+    free(data);
+}
+url_free(ctx);
+```
+
+Хранилище — единый список на все `UrlCtx`; сопоставление по правилам RFC 6265 (атрибуты Domain/Path, Secure только по TLS, Max-Age/Expires). Для прямого доступа к списку доступны `url_cookie_header_for()`, `url_cookie_set_from_url()`, `url_cookie_load()` и `url_cookie_save()`.
 
 ## License
 
