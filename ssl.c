@@ -24,6 +24,7 @@
 #include "ssl.h"
 #include "tls.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #ifndef NULL
@@ -380,7 +381,6 @@ static int ssl_sock_read(SSL *ssl, uint8_t *buf, int len) {
                 return -1;
             }
         } else {
-            //fprintf(stderr, "recv error err=%d\n", err);
             si->rw_error = 1;
             return -1;
         }
@@ -538,11 +538,6 @@ static int ssl_do_handshake(SSL *ssl) {
         if (in_len == SSL_READ_INVALID) {
             /* Peer sent non-TLS / invalid data on TLS port: this is
              * a real protocol violation, not a canceled connection. */
-            /*
-             * fprintf(stderr, "[ssl] handshake ERROR: invalid record data (%d) from peer\n", in_len);
-             * for (int i = 0; i < 32 && i < (int)sizeof(in); i++) fprintf(stderr, "%02x ", in[i]);
-             * fprintf(stderr, "\n");
-             */
             return -1;
         }
         if (in_len <= 0) {
@@ -590,19 +585,9 @@ static int ssl_do_handshake(SSL *ssl) {
                     }
                 }
             }
-            /*
-             * fprintf(stderr, "[ssl] handshake step ERROR (state=%d in_len=%d): ", ctx->handshake_state, in_len);
-             * for (int i = 0; i < in_len && i < 32; i++) fprintf(stderr, "%02x ", in[i]);
-             * fprintf(stderr, "\n");
-             */
             return -1;
         }
         if (ret == TLS_RSA_ERROR) {
-            /*
-             * fprintf(stderr, "[ssl] handshake step ERROR (state=%d in_len=%d): ", ctx->handshake_state, in_len);
-             * for (int i = 0; i < in_len && i < 32; i++) fprintf(stderr, "%02x ", in[i]);
-             * fprintf(stderr, "\n");
-             */
             return -1;
         }
         if (ret == TLS_RSA_NEED_MORE_DATA) {

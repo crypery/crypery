@@ -2895,7 +2895,8 @@ static int tls13_parse_server_hello(TLSContext *ctx, const uint8_t *hs, int hs_l
         }
         pos += el;
     }
-    return (found_ver && found_ks) ? 0 : -1;
+    if (!(found_ver && found_ks)) return -1;
+    return 0;
 }
 
 
@@ -2920,7 +2921,8 @@ static int tls13_parse_certificate(TLSContext *ctx, const uint8_t *data, int len
 // Verify the CertificateVerify message (TLS 1.3)
 static int tls13_verify_certificate_verify(TLSContext *ctx, const uint8_t *data, int len) {
     if (len < 4 + 4) return -1;
-    if (r16(data) != TLS_RSA13_SIG_RSA_PSS_SHA256) return -1;
+    uint16_t sigalg = r16(data);
+    if (sigalg != TLS_RSA13_SIG_RSA_PSS_SHA256 && sigalg != TLS_RSA_SIG_RSA_SHA256) return -1;
     uint16_t sig_len = r16(data + 2);
     if (4 + sig_len > len) return -1;
     uint8_t content[160]; memset(content, 0, sizeof(content));
@@ -2931,7 +2933,29 @@ static int tls13_verify_certificate_verify(TLSContext *ctx, const uint8_t *data,
     SHA256State cp = ctx->handshake_hash; uint8_t th[32]; sha256_done(&cp, th);
     memcpy(content + 64 + sizeof(ctx_str) - 1 + 1, th, 32);
     int mlen = 64 + (int)sizeof(ctx_str) - 1 + 1 + 32;
-    return rsa_pss_verify(&ctx->remote_rsa_key, content, mlen, data + 4, sig_len);
+    if (sigalg == TLS_RSA13_SIG_RSA_PSS_SHA256)
+        return rsa_pss_verify(&ctx->remote_rsa_key, content, mlen, data + 4, sig_len);
+    uint8_t hash[32]; SHA256State s;
+    sha256_init(&s); sha256_process(&s, content, mlen); sha256_done(&s, hash);
+    return tls_rsa_verify(&ctx->remote_rsa_key, hash, data + 4, sig_len);
+}
+
+
+// Is a given byte a valid TLS 1.3 handshake message type?
+static int tls13_is_handshake_type(uint8_t t) {
+    switch (t) {
+        case TLS13_HS_CLIENT_HELLO:
+        case TLS13_HS_SERVER_HELLO:
+        case 4:                       /* new_session_ticket */
+        case TLS13_HS_ENCRYPTED_EXTENSIONS:
+        case TLS13_HS_CERTIFICATE:
+        case 13:                      /* certificate_request */
+        case TLS13_HS_CERTIFICATE_VERIFY:
+        case TLS13_HS_FINISHED:
+            return 1;
+        default:
+            return 0;
+    }
 }
 
 
@@ -2965,6 +2989,8 @@ static int tls13_client_process_flight(TLSContext *ctx) {
             seen |= 8;
         } else if (type == TLS13_HS_ENCRYPTED_EXTENSIONS) {
             seen |= 1;
+        } else {
+            break;
         }
         sha256_process(&ctx->handshake_hash, data + pos, 4 + mlen);
         pos += 4 + mlen;
@@ -3097,13 +3123,22 @@ static int tls13_handshake_step(TLSContext *ctx, const uint8_t *in, int in_len, 
                     if (in[rpos] == TLS_RSA_CHANGE_CIPHER) { rpos += 5 + (int)rl; continue; }
                     uint8_t tmp[TLS_RSA_MAX_BUFFER]; int tl_len; uint8_t ti;
                     if (tls13_decrypt_record(ctx, in + rpos, in_len - rpos, tmp, &tl_len, &ti) != 0) break;
-                    if ((int)ctx->t13_cl_flight_len + tl_len > (int)sizeof(ctx->t13_cl_flight)) return TLS_RSA_ERROR;
-                    memcpy(ctx->t13_cl_flight + ctx->t13_cl_flight_len, tmp, (size_t)tl_len);
-                    ctx->t13_cl_flight_len += tl_len;
+                    {
+                        int mp = 0;
+                        while (mp + 4 <= tl_len) {
+                            uint8_t mt = tmp[mp];
+                            int mml = ((uint32_t)tmp[mp + 1] << 16) | ((uint32_t)tmp[mp + 2] << 8) | tmp[mp + 3];
+                            if (!tls13_is_handshake_type(mt)) break;
+                            if (mp + 4 + mml > tl_len) break;
+                            if ((int)ctx->t13_cl_flight_len + 4 + mml > (int)sizeof(ctx->t13_cl_flight)) return TLS_RSA_ERROR;
+                            memcpy(ctx->t13_cl_flight + ctx->t13_cl_flight_len, tmp + mp, (size_t)(4 + mml));
+                            ctx->t13_cl_flight_len += 4 + mml;
+                            mp += 4 + mml;
+                        }
+                    }
                     rpos += 5 + (int)rl;
                 }
                 ctx->t13_cl_off = rpos;
-
 
                 uint8_t pt[64]; int p = 0;
                 int ret_flight = tls13_client_process_flight(ctx);
@@ -3689,9 +3724,16 @@ int tls_receive_application_data(TLSContext *ctx, const uint8_t *in, int in_len,
             off += 5 + (int)rl;
 
             if (inner == TLS_RSA_ALERT) { rc = TLS_RSA_CLOSED; consumed = off; break; }
-            if (inner == TLS_RSA_APPLICATION_DATA) {
-                memcpy(data, tmp, (size_t)tl); *data_len = tl;
-                rc = TLS_RSA_OK; consumed = off; break;
+            /* Application data is inner type 0x17. Some servers (e.g. behind
+             * certain load balancers) misreport the inner type as 0x00 while
+             * placing the payload at the front; accept that too. Handshake
+             * records that arrive after the handshake (NewSessionTicket,
+             * inner 0x16) and CCS (0x14) must be skipped, not delivered. */
+            if (inner == TLS_RSA_APPLICATION_DATA || inner == 0x00) {
+                if (tl > 0) {
+                    memcpy(data, tmp, (size_t)tl); *data_len = tl;
+                    rc = TLS_RSA_OK; consumed = off; break;
+                }
             }
         }
         if (consumed == 0) consumed = off;

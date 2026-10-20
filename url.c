@@ -1290,7 +1290,7 @@ static SSL *tls_connect_socket(SOCKET sock, const char *host, int insecure, int 
     tls_set_server_name((TLSContext *)ssl, host, (int)strlen(host));
 
     int ret = SSL_connect(ssl);
-    if (ret < 0) {
+    if (ret != 0) {
         int err = SSL_get_error(ssl, ret);
 #if URL_LOGGING
         if (verbose && log) log("* TLS handshake failed (error=%d)\n", err);
