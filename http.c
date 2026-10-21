@@ -27,6 +27,12 @@
 #include <time.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <signal.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <execinfo.h>
+#endif
 
 // Paths and name patterns that are never served to clients
 static const char *http_blocked_paths[] = {
@@ -119,18 +125,6 @@ static int http_find_host(const char *r, size_t rl, const char **hv_out, size_t 
         return 1;
     }
     return 0;
-}
-
-/* Validate the request Host header against the configured domain table.
- * Returns 1 when the host is allowed or no Host header is present, 0 when
- * the request must be rejected. */
-static int http_check_host(const http_server_t *http, http_ctx_t *c) {
-    const char *r = http_req_buf(c);
-    size_t rl = c->rlen;
-    const char *hv = NULL;
-    size_t hl = 0;
-    if (http_find_host(r, rl, &hv, &hl)) return http_host_allowed(http, hv, hl);
-    return 1;
 }
 
 /* Send a "301 Moved Permanently" redirect from www. host to the bare domain.
@@ -694,7 +688,10 @@ void http_p_start(http_server_t *http, int n, int sz) {
     http_pool_t *pool = &http->pool;
     memset(pool, 0, sizeof(http_pool_t));
     pool->nt = (unsigned)(n > 0 ? n : 1);
+    /* The queue can never hold more connections than the server ctx table
+     * can allocate (one slot per live connection). */
     pool->qs = sz < 1 ? 1 : sz;
+    if (pool->qs > MAX_CLIENTS) pool->qs = MAX_CLIENTS;
     pool->q = (http_ctx_t **)calloc((size_t)pool->qs, sizeof(http_ctx_t *));
     evt_init(&pool->ev);
     pool->th = (thr_t *)calloc((size_t)pool->nt, sizeof(thr_t));
@@ -709,17 +706,15 @@ void http_p_stop(http_server_t *http) {
     if (!pool->q) return;
     {
         /* Unblock workers stuck in recv()/send() by shutting down every
-         * live connection. Collect fds under the ctx lock; the worker that
-         * owns a socket performs the final close/free. */
-        SOCKET dead[MAX_CLIENTS];
-        int ndead = 0;
+         * live connection, while still holding the ctx lock so the fd is
+         * guaranteed to belong to that live connection (see http_reaper).
+         * The worker that owns the socket performs the final close/free. */
         mtx_lock(&http->ctx_lock);
         for (int i = 0; i < MAX_CLIENTS; i++) {
             http_ctx_t *c = http->ctx[i];
-            if (c && (int)c->fd > 0) { c->reaped = 1; dead[ndead++] = c->fd; }
+            if (c && (int)c->fd > 0) { c->reaped = 1; shutdown(c->fd, SD_BOTH); }
         }
         mtx_unlock(&http->ctx_lock);
-        for (int i = 0; i < ndead; i++) shutdown(dead[i], SD_BOTH);
     }
     for (unsigned i = 0; i < pool->nt; i++) evt_signal(&pool->ev);
     for (unsigned i = 0; i < pool->nt; i++) thr_join(&pool->th[i]);
@@ -744,28 +739,44 @@ static void http_p_push(http_server_t *http, http_ctx_t *c) {
     if (pool->qt - pool->qh < pool->qs) {
         pool->q[pool->qt % pool->qs] = c;
         pool->qt++;
-        mtx_unlock(&pool->cs);
+        /* Signal under the lock: a worker that concurrently sees the queue
+         * empty and resets the event is serialized with this push, so the
+         * wakeup cannot be lost. */
         evt_signal(&pool->ev);
+        mtx_unlock(&pool->cs);
     } else {
         mtx_unlock(&pool->cs);
         http_conn_close(http, c);
     }
 }
 
-// Serve a connection end-to-end in this worker thread
+/* Serve a connection end-to-end in this worker thread.
+ *
+ * Wakeup protocol (lost-wakeup safe): pool->ev is a manual-reset event that
+ * stays "set" until a worker observes the queue empty and re-arms it. On
+ * wake-up the worker re-checks the queue under pool->cs; a push publishes an
+ * item under the same lock before setting the event, so a push racing with
+ * the check either makes the queue non-empty (the worker sees it) or its
+ * evt_signal lands after the reset and wakes the worker again. The old
+ * auto-reset event stored a single wakeup token, so a burst of connections
+ * queued while all workers were asleep orphaned the surplus connections in
+ * the queue forever (they then pinned their ctx slots until the table
+ * filled and the server stopped accepting). */
 static void *http_worker(void *p) {
     http_server_t *http = (http_server_t *)p;
     http_pool_t *pool = &http->pool;
     for (;;) {
         if (http->shutdown) break;
         evt_wait(&pool->ev);
-        if (http->shutdown) break;
         http_ctx_t *c = NULL;
         mtx_lock(&pool->cs);
         if (pool->qt > pool->qh) {
             c = pool->q[pool->qh % pool->qs];
             pool->qh++;
-            if (pool->qt > pool->qh) evt_signal(&pool->ev);
+        } else if (!http->shutdown) {
+            /* Stale wakeup: the item that set the event was already
+             * consumed. Re-arm the event before going back to sleep. */
+            evt_reset(&pool->ev);
         }
         mtx_unlock(&pool->cs);
         if (!c) continue;
@@ -838,7 +849,6 @@ static void http_conn_close(http_server_t *http, http_ctx_t *c) {
 // up with an I/O error and does the close/free itself - no use-after-free.
 static void *http_reaper(void *p) {
     http_server_t *http = (http_server_t *)p;
-    SOCKET dead[128];
     for (;;) {
 #ifdef _WIN32
         Sleep(1000);
@@ -848,18 +858,24 @@ static void *http_reaper(void *p) {
         if (http->shutdown) break;
         unsigned long now = compat_tick();
         const unsigned long idle_ms = 30000; /* max silence before request is read */
+        const int reap_batch = 128;          /* max shutdowns per sweep */
         int ndead = 0;
         mtx_lock(&http->ctx_lock);
-        for (int i = 0; i < MAX_CLIENTS && ndead < (int)(sizeof(dead) / sizeof(dead[0])); i++) {
+        for (int i = 0; i < MAX_CLIENTS && ndead < reap_batch; i++) {
             http_ctx_t *c = http->ctx[i];
             if (c && !c->reaped && !c->req_done && (int)c->fd > 0 &&
                 now - c->last_active >= idle_ms) {
                 c->reaped = 1;
-                dead[ndead++] = c->fd;
+                /* shutdown() while still holding the ctx lock: the fd is
+                 * guaranteed to belong to this live connection. The owning
+                 * worker wakes up with an I/O error and does the close/free.
+                 * Doing it outside the lock could hit an fd number that was
+                 * already closed and reused by a new connection. */
+                shutdown(c->fd, SD_BOTH);
+                ndead++;
             }
         }
         mtx_unlock(&http->ctx_lock);
-        for (int i = 0; i < ndead; i++) shutdown(dead[i], SD_BOTH);
     }
     return NULL;
 }
@@ -1153,9 +1169,11 @@ static void http_sfile_gzip_compress(http_server_t *http, http_ctx_t *c, const c
 void http_sfile(http_server_t *http, http_ctx_t *c, const char *rel) {
 #ifndef HTTP_NO_GZIP
     http_sfile_gz(http, c, rel, http_req_buf(c), c->rlen < sizeof(c->rb) ? c->rlen : 0);
-    if (c->wlen > 0 && strchr((const char *)c->wb + c->wlen - 100, '4') == NULL) {
-        if (strstr((char *)c->wb, "Content-Encoding: gzip")) return;
-    }
+    /* http_sfile_gz either wrote nothing or a complete gzip response; the
+     * marker check below must not read past the write buffer (the old
+     * "last 100 bytes" probe ran off the heap start for small wlen and,
+     * when it failed, the raw file was appended after the gzip body). */
+    if (c->wlen > 0 && c->wb && strstr((char *)c->wb, "Content-Encoding: gzip")) return;
 #endif
     char path[2048]; snprintf(path, sizeof(path), "%s%s", http_doc_root(http, c), rel);
     FILE *f = fopen(path, "rb");
@@ -1199,17 +1217,19 @@ void http_html_escape_str(char *dst, size_t dst_size, const char *s) {
     dst[j] = '\0';
 }
 
-// Extract Content-Type from request headers
-const char *http_get_content_type(const char *raw_hdr) {
+// Extract Content-Type from request headers into a caller-provided buffer
+// (the previous static buffer was shared between worker threads).
+// Returns out on success, NULL when no Content-Type header is present.
+const char *http_get_content_type(const char *raw_hdr, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return NULL;
     const char *p = http_strcasestr_custom(raw_hdr, "Content-Type:");
     if (!p) return NULL;
     p += 13;
     while (*p == ' ') p++;
-    static char buf[256];
     size_t i = 0;
-    while (*p && *p != '\r' && *p != '\n' && i < sizeof(buf) - 1) { buf[i++] = *p++; }
-    buf[i] = '\0';
-    return buf;
+    while (*p && *p != '\r' && *p != '\n' && i < out_sz - 1) { out[i++] = *p++; }
+    out[i] = '\0';
+    return out;
 }
 
 // Check if client Accept-Encoding includes gzip
@@ -1364,18 +1384,37 @@ int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
     if (http->log_fn) http->log_fn(HTTP_LOG_LEVEL_INFO, "[request] %s %s\n", method, uri);
 #endif
     if (strlen(uri) > MAX_URI_LENGTH) { http_send_json_response(http, c, 414, "{\"error\":\"URI too long\"}"); return 1; }
+    /* Normalize the request target (RFC 7230): an absolute-form target
+     * "http://host/path" is reduced to its path, and every origin-form
+     * target must start with '/'. */
+    {
+        const char *sl = NULL;
+        if (_strnicmp(uri, "http://", 7) == 0) sl = strchr(uri + 7, '/');
+        else if (_strnicmp(uri, "https://", 8) == 0) sl = strchr(uri + 8, '/');
+        if (sl) memmove(uri, sl, strlen(sl) + 1);
+    }
+    if (uri[0] != '/') { http_send_json_response(http, c, 400, "{\"error\":\"Invalid request URI\"}"); http_update_status_stats(http, 400); return 1; }
     if (http_check_path_traversal(uri)) { http_send_json_response(http, c, 400, "{\"error\":\"Path traversal detected\"}"); http_update_status_stats(http, 400); return 1; }
     if (http_handle_www_redirect(http, c, uri)) return 1;
-    if (!http_check_host(http, c)) { http_send_json_response(http, c, 400, "{\"error\":\"Invalid Host header\"}"); http_update_status_stats(http, 400); return 1; }
-    /* Resolve the request domain: its entry (for per-domain routes) and
-     * document root (NULL = default root). */
+    /* Validate the Host header and resolve the request domain (per-domain
+     * routes + document root). A Host that matches no configured domain -- an
+     * unknown subdomain as well as a syntactically broken / empty value -- is
+     * DROPPED: the connection is closed without sending any response (instead
+     * of a 404 page or a 400). No Host header: default root. */
     {
         const char *hv = NULL;
         size_t hl = 0;
         c->domain = NULL;
         c->doc_root = NULL;
-        if (http_find_host(raw, rlen, &hv, &hl)) c->domain = http_find_domain(http, hv, hl);
-        if (c->domain) c->doc_root = c->domain->root;
+        if (http_find_host(raw, rlen, &hv, &hl)) {
+            c->domain = http_find_domain(http, hv, hl);
+            if (!c->domain) {
+                /* Host does not match any configured domain (unknown or
+                 * malformed/empty): drop the connection without a response. */
+                return 1;
+            }
+            c->doc_root = c->domain->root;
+        }
     }
     const char *body_start = http_memmem(raw, rlen, "\r\n\r\n", 4);
     if (!body_start) { http_send_json_response(http, c, 400, "{\"error\":\"Invalid HTTP request\"}"); return 1; }
@@ -1596,10 +1635,13 @@ static void http_serve_conn(http_server_t *http, http_ctx_t *c) {
         }
         c->handshake_state = 1;
     }
-    if (http_conn_read_request(http, c) != 0) { http_send_buf(http, c); return; }
+    if (http_conn_read_request(http, c) != 0) {
+        http_send_buf(http, c);
+        return;
+    }
     c->req_done = 1; /* request fully read - the reaper must not touch it
-                       (the client is allowed to stay silent while it
-                       receives the response) */
+                      (the client is allowed to stay silent while it
+                      receives the response) */
     http_do_parse(http, c, c->rb, c->rlen);
     http_send_buf(http, c);
 }
@@ -1668,7 +1710,9 @@ static int http_accept_loop(http_server_t *http) {
         }
 
         http_ctx_t *c = http_ctx_alloc(http, sock, is_tls);
-        if (!c) { shutdown(sock, SD_BOTH); closesocket(sock); continue; }
+        if (!c) {
+            shutdown(sock, SD_BOTH); closesocket(sock); continue;
+        }
         if (is_tls) {
             SSL *ssl = SSL_new(http->ssl_ctx);
             if (!ssl) { http_conn_close(http, c); continue; }
@@ -1797,6 +1841,16 @@ int http_multipart_parse(http_multipart_form_t *form, const char *body, size_t b
     int dl = snprintf(delim, sizeof(delim), "--%s", boundary);
     int cl = snprintf(closing, sizeof(closing), "--%s--", boundary);
     int nl = snprintf(nxt, sizeof(nxt), "\r\n--%s", boundary);
+    /* snprintf returns the length that WOULD have been written: an overlong
+     * boundary (up to the 8KB header line) truncates the pattern while dl
+     * still reports the full length - using it in http_memmem would read out
+     * of the stack buffer. Empty boundaries are meaningless as well. */
+    if (!boundary || !boundary[0] ||
+        dl <= 0 || dl >= (int)sizeof(delim) ||
+        cl <= 0 || cl >= (int)sizeof(closing) ||
+        nl <= 0 || nl >= (int)sizeof(nxt)) {
+        free(form->fields); form->fields = NULL; return 0;
+    }
     const char *end = body + body_len;
     const char *pos = http_memmem(body, body_len, delim, (size_t)dl);
     if (!pos) { free(form->fields); form->fields = NULL; return 0; }
@@ -1957,8 +2011,13 @@ int http_ws_read_frame(SOCKET fd, unsigned char *rb, size_t rlen, size_t off, ht
         header_ext_len = 10;
     }
     if (!is_masked && opcode != HTTP_WS_OPCODE_CLOSE) return 0;
+    /* Bound the (client-claimed) payload before any arithmetic: the 127-form
+     * carries a 64-bit length, and "header_ext_len + payload_len" would wrap
+     * for huge values, slip past the size guard, and make the in-place
+     * unmask loop below write far past the receive buffer. */
+    if (payload_len > 0x7FFFFFFFULL) return 0;
     size_t mask_off = header_ext_len + (is_masked ? 4 : 0);
-    if (rlen - off < mask_off + payload_len) return 0;
+    if (payload_len > rlen - off || (size_t)payload_len > (rlen - off) - mask_off) return 0;
     frame->is_masked = is_masked;
     frame->payload_len = payload_len;
     frame->payload_len_total = payload_len;

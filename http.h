@@ -30,6 +30,7 @@ extern "C" {
 
 #include "ssl.h"
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -133,12 +134,27 @@ static DWORD WINAPI thr_trampoline(LPVOID p) {
     free(ta);
     return 0;
 }
+static long g_thr_debug_count = 0;
+static void *g_thr_trace_buf[16];
 static inline int thr_create(thr_t *t, thr_fn_t fn, void *arg) {
     thr_arg_t *ta = (thr_arg_t *)malloc(sizeof(thr_arg_t));
     if (!ta) return -1;
     ta->fn = fn; ta->arg = arg;
     *t = CreateThread(NULL, 0, thr_trampoline, ta, 0, NULL);
     if (*t == NULL) { free(ta); return -1; }
+    if (GetEnvironmentVariable("THR_TRACE", NULL, 0)) {
+        CaptureStackBackTrace(1, 16, g_thr_trace_buf, NULL);
+        FILE *lf = fopen("C:\\Users\\Admin\\AppData\\Local\\Temp\\opencode\\thr_trace.log", "a");
+        if (lf) {
+            fprintf(lf, "THR_CREATE #%ld fn=%p arg=%p frames: ", ++g_thr_debug_count, (void *)fn, arg);
+            for (int i = 0; i < 16; i++) {
+                if (!g_thr_trace_buf[i]) break;
+                fprintf(lf, "%s%p", (i ? " | " : ""), (void *)g_thr_trace_buf[i]);
+            }
+            fprintf(lf, "\n");
+            fclose(lf);
+        }
+    }
     return 0;
 }
 static inline void thr_join(thr_t *t) { WaitForSingleObject(*t, INFINITE); CloseHandle(*t); }
@@ -150,11 +166,19 @@ static inline int thr_create(thr_t *t, thr_fn_t fn, void *arg) {
 static inline void thr_join(thr_t *t) { pthread_join(*t, NULL); }
 #endif
 
-// --- auto-reset event (one pending wakeup) ---
+/* --- manual-reset event (wakeup stays pending until evt_reset) ---
+ *
+ * Used to wake the pool workers: one evt_signal() per queued item is NOT
+ * enough to describe the queue state, so the event must accumulate: a waiter
+ * re-checks the shared predicate (the queue) under the pool lock and calls
+ * evt_reset() only when it goes back to sleep with the queue empty. This is
+ * what prevents lost wakeups on connection bursts (several items queued
+ * while every worker is asleep). */
 #ifdef _WIN32
 typedef HANDLE evt_t;
-static inline void evt_init(evt_t *e)    { *e = CreateEvent(NULL, FALSE, FALSE, NULL); }
+static inline void evt_init(evt_t *e)    { *e = CreateEvent(NULL, TRUE, FALSE, NULL); }
 static inline void evt_signal(evt_t *e)  { SetEvent(*e); }
+static inline void evt_reset(evt_t *e)   { ResetEvent(*e); }
 static inline void evt_wait(evt_t *e)    { WaitForSingleObject(*e, INFINITE); }
 static inline void evt_destroy(evt_t *e) { CloseHandle(*e); }
 #else
@@ -167,13 +191,17 @@ static inline void evt_init(evt_t *e) {
 static inline void evt_signal(evt_t *e) {
     pthread_mutex_lock(&e->m);
     e->flag = 1;
-    pthread_cond_signal(&e->c);
+    pthread_cond_broadcast(&e->c);
+    pthread_mutex_unlock(&e->m);
+}
+static inline void evt_reset(evt_t *e) {
+    pthread_mutex_lock(&e->m);
+    e->flag = 0;
     pthread_mutex_unlock(&e->m);
 }
 static inline void evt_wait(evt_t *e) {
     pthread_mutex_lock(&e->m);
     while (!e->flag) pthread_cond_wait(&e->c, &e->m);
-    e->flag = 0;
     pthread_mutex_unlock(&e->m);
 }
 static inline void evt_destroy(evt_t *e) {
@@ -705,10 +733,13 @@ const char *http_get_cookie(http_ctx_t *c, const char *name);
 int http_set_cookie(http_server_t *http, http_ctx_t *c, const char *name, const char *value,
                     const char *path, long max_age, int secure, int http_only);
 
-/* Extract the Content-Type value from raw request headers.
+/* Extract the Content-Type value from raw request headers into a
+ * caller-provided buffer (thread-safe: no shared state).
  * @param raw_hdr Raw request headers.
- * @return The value, or NULL if absent. */
-const char *http_get_content_type(const char *raw_hdr);
+ * @param out Destination buffer.
+ * @param out_sz Destination capacity.
+ * @return out on success, NULL if the header is absent or args are invalid. */
+const char *http_get_content_type(const char *raw_hdr, char *out, size_t out_sz);
 
 /* HTML-escape a string into a destination buffer.
  * @param dst Destination buffer.
