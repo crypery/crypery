@@ -1166,7 +1166,7 @@ char *url_build_request(const UrlCtx *ctx, const UrlInfo *u, const char *method,
     url_header_add(&L, "Connection", "close");
 
     /* attach stored cookies for this URL (shared jar, if enabled) */
-    if (ctx->use_cook && strcmp(method, "GET") == 0) {
+    if (ctx->use_cook) {
         char curl[URL_MAX_PATH * 2 + 128];
         snprintf(curl, sizeof(curl), "%s://%s%s", u->is_ssl ? "https" : "http",
                  u->host, u->path);
