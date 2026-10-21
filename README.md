@@ -100,7 +100,16 @@ A self-contained HTTP/HTTPS client library built on the built-in TLS stack:
 
 ## Usage Examples
 
+Projects using Crypery network stack:
+
+- https://github.com/crypery/mini-cert
+- https://github.com/crypery/mini-acme
+- https://github.com/crypery/mini-ftps
+
 ### tls
+
+Project using this library:
+- https://github.com/crypery/mini-tls
 
 Generating a key, a self-signed certificate, and performing a handshake:
 
@@ -176,6 +185,9 @@ The client side is analogous: `SSL_connect()` instead of `SSL_accept()`.
 
 ### http
 
+Project using this library:
+- https://github.com/crypery/mini-https
+
 A server with an API route and static file serving:
 
 ```c
@@ -215,6 +227,9 @@ int main(void)
 Requests to paths without registered routes are automatically served by static file serving from the document root of the request's `Host` domain (see `http_domain()`); when no domains are configured every host is served from the built-in default root `DEF_ROOT` (`www`). Routes are registered per domain: `http_route(http, domain, method, path, handler)` applies only to that domain, or to every domain when the domain argument is `NULL`.
 
 ### url
+
+Project using this library:
+- https://github.com/crypery/mini-curl
 
 Performing an HTTPS request:
 
