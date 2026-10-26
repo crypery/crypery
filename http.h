@@ -12,6 +12,25 @@
  * security checks. Create a server with http_init(), configure its fields,
  * register routes with http_route(), start it with http_run(), and release it
  * with http_free().
+ *
+ * Example:
+ *   http_server_t *http = http_init();
+ *   http->port      = 443;
+ *   http->ssl_use   = true;
+ *   http->cert_file = "localhost.crt";
+ *   http->key_file  = "localhost.key";
+ *   http_domain(http, "localhost", "www");
+ *   http_route(http, "localhost", "GET", "/api/info", handle_info);
+ *   http_run(http, my_log_cb);  // pass NULL to silence module logging
+ *   http_free(http);
+ *
+ * Requests to paths without a registered route are served as static files
+ * from the request Host's document root: files up to 10 MB are read fully
+ * into memory and sent right after the headers, while larger files are
+ * streamed to the client chunk by chunk (read part -> send part). Each
+ * connection keeps its own FILE*, so the file is never locked and many
+ * clients can download it at once; the I/O limits apply to each sent chunk
+ * (a fresh timeout window per operation), never to the transfer as a whole.
  */
 
 #ifndef HTTP_H

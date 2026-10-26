@@ -46,6 +46,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <io.h>
 #else
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -93,6 +94,11 @@
 #ifndef INVALID_SOCKET
 #define INVALID_SOCKET (-1)
 #endif
+
+// Response bodies up to this size are buffered in memory exactly like
+// url_run() always did; larger (or size-unknown / chunked) bodies are
+// streamed to the output file chunk by chunk (url_download_file).
+#define URL_STREAM_THRESHOLD (10 * 1024 * 1024)
 
 // Toggle non-blocking mode on a socket (portable FIONBIO / O_NONBLOCK)
 static int set_nonblocking(SOCKET s, int on) {
@@ -1311,61 +1317,82 @@ typedef struct {
     char pending[65536];
     int pending_len;
     int eof;
+    int io_failed;           // real transport error (reset / TLS error)
+    int io_timeout_ms;       // fresh timeout window per read operation
+    int idle_limit_ms;       // max gap without a single received byte
+    unsigned last_data_tick; // tick of the last received byte
 } Transport;
 
-// Fill pending buffer from socket or SSL connection
+// 1 when the gap without data exceeded the idle limit
+static int tp_idle_exceeded(Transport *t) {
+    if (t->idle_limit_ms <= 0) return 0;
+    return (net_tick() - t->last_data_tick) >= (unsigned)t->idle_limit_ms;
+}
+
+/* Fill pending buffer from socket or SSL connection.
+ *
+ * Timeout policy (mirrors the server side): every recv()/SSL_read() call gets
+ * a FRESH io_timeout window, and a timeout is NOT the end of the transfer -
+ * the read is retried while the data-less gap stays below idle_limit_ms.
+ * The limits therefore apply to each received chunk of data, never to the
+ * transfer as a whole: a multi-gigabyte download runs as long as it wants,
+ * as long as the bytes keep arriving; only a silent (dead) link fails, after
+ * idle_limit_ms without a single byte. */
 static int tp_fill(Transport *t) {
     if (t->pending_len > 0) return 1;
     char buf[16384];
     int n;
     if (t->is_ssl) {
-        int retries = 0;
         for (;;) {
             n = SSL_read(t->ssl, buf, (int)sizeof(buf));
             if (n > 0) break;
             if (n == 0) {
-                /* SSL_read returned 0 = clean close (close_notify).
-                 * Accept whatever we have or signal EOF. */
-                t->eof = 1;
-                return t->pending_len > 0 ? 1 : 0;
-            }
-            /* SSL_read returned -1. Check if it's a transient timeout
-             * (rw_error == 0) or a real socket error (rw_error == 1).
-             * ssl_sock_read sets rw_error=1 only for real errors like
-             * ECONNRESET; for timeouts/EAGAIN it stays 0. */
-            SSLInternal *si = ssl_get_internal(t->ssl);
-            if (si && si->rw_error) {
-                return -1;
-            }
-            retries++;
-            if (retries > 5) {
+                /* SSL_read returned 0 = clean close (close_notify). */
                 t->eof = 1;
                 return 0;
+            }
+            /* SSL_read returned -1. Real socket error (rw_error == 1, e.g.
+             * ECONNRESET) vs transient timeout (rw_error == 0). */
+            SSLInternal *si = ssl_get_internal(t->ssl);
+            if (si && si->rw_error) {
+                t->io_failed = 1;
+                return -1;
+            }
+            /* Timed out: retry with a fresh window unless the link went
+             * silent for the whole idle limit. */
+            if (tp_idle_exceeded(t)) {
+                t->io_failed = 1;
+                return -1;
             }
             net_sleep(2);
         }
     } else {
-        int retries = 0;
         for (;;) {
             n = (int)recv(t->sock, buf, (int)sizeof(buf), 0);
             if (n > 0) break;
             if (n == 0) {
                 t->eof = 1;
-                return t->pending_len > 0 ? 1 : 0;
+                return 0;
             }
             int err = net_err();
-            if (err == NET_CONNRESET || err == NET_TIMEDOUT) {
-                t->eof = 1;
-                return t->pending_len > 0 ? 1 : 0;
+            if (err == NET_CONNRESET) {
+                t->io_failed = 1;
+                return -1;
             }
-            retries++;
-            if (retries > 5) {
-                t->eof = 1;
-                return 0;
+            if (err != NET_TIMEDOUT && err != NET_INPROGRESS) {
+                t->io_failed = 1;
+                return -1;
+            }
+            /* Timed out: retry with a fresh SO_RCVTIMEO window unless the
+             * link went silent for the whole idle limit. */
+            if (tp_idle_exceeded(t)) {
+                t->io_failed = 1;
+                return -1;
             }
             net_sleep(2);
         }
     }
+    t->last_data_tick = net_tick();
     memcpy(t->pending, buf, (size_t)n);
     t->pending_len = n;
     return 1;
@@ -1408,6 +1435,24 @@ static int tp_read_line(Transport *t, char *out, int sz) {
     out[got] = '\0';
     while (got > 0 && (out[got - 1] == '\n' || out[got - 1] == '\r')) out[--got] = '\0';
     return 1;
+}
+
+// Truncate a file opened for reading and writing to zero length and rewind it
+static int file_truncate_to_zero(FILE *f) {
+#ifdef _WIN32
+    int fd = _fileno(f);
+    if (fd < 0) return -1;
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    if (SetFilePointer(h, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER) return -1;
+    if (!SetEndOfFile(h)) return -1;
+    return fseek(f, 0, SEEK_SET) == 0 ? 0 : -1;
+#else
+    int fd = fileno(f);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, 0) != 0) return -1;
+    return fseek(f, 0, SEEK_SET) == 0 ? 0 : -1;
+#endif
 }
 
 // Close transport (SSL and socket)
@@ -1471,26 +1516,77 @@ static void verbose_response(UrlLogFn log, const ResponseHead *rh) {
 #endif
 }
 
-// Read fixed-length body from transport into a string buffer
-static int read_body_fixed(Transport *t, uint64_t len, StrBuf *b) {
+// Body destination: either a growable in-memory buffer (url_run) or a local
+// file (url_download_file). File mode streams the body to disk chunk by
+// chunk, so large downloads never need to fit in RAM.
+typedef struct {
+    int to_file;
+    FILE *f;
+    StrBuf *mem;
+    size_t written;
+    uint64_t total;          // expected size, 0 = unknown
+    UrlLogFn log;
+    int verbose;
+    unsigned last_log_tick;
+    int last_pct;
+} BodySink;
+
+// Append a received chunk of body data to the sink. Returns -1 on a failed
+// file write. In file mode a throttled progress line goes to the log
+// callback (verbose only) - the data itself is never printed to the console.
+static int sink_append(BodySink *s, const char *data, size_t len) {
+    if (len == 0) return 0;
+    if (s->to_file) {
+        if (fwrite(data, 1, len, s->f) != len) return -1;
+        s->written += len;
+#if URL_LOGGING
+        if (s->verbose && s->log) {
+            unsigned now = net_tick();
+            int pct = s->total > 0 ? (int)(s->written * 100 / s->total) : -1;
+            if (now - s->last_log_tick >= 500 ||
+                (pct >= 0 && pct != s->last_pct) ||
+                (s->total > 0 && s->written >= s->total)) {
+                s->last_log_tick = now;
+                s->last_pct = pct;
+                if (pct >= 0) s->log("* [download] %llu/%llu bytes (%d%%)\n",
+                                     (unsigned long long)s->written,
+                                     (unsigned long long)s->total, pct);
+                else s->log("* [download] %llu bytes\n",
+                            (unsigned long long)s->written);
+            }
+        }
+#endif
+    } else {
+        sb_append(s->mem, data, len);
+        s->written += len;
+    }
+    return 0;
+}
+
+// Read fixed-length body from transport into the sink
+static int read_body_fixed(Transport *t, uint64_t len, BodySink *s) {
     char buf[16384];
     uint64_t got = 0;
     while (got < len) {
         size_t want = sizeof(buf);
         if (len - got < want) want = (size_t)(len - got);
         int n = tp_read(t, buf, (int)want);
-        if (n <= 0) break;
-        sb_append(b, buf, (size_t)n);
+        if (n <= 0) {
+            if (t->io_failed) return -1;
+            break; /* early clean EOF: caller compares written vs. expected */
+        }
+        if (sink_append(s, buf, (size_t)n) != 0) return -1;
         got += (uint64_t)n;
     }
     return 0;
 }
 
-// Read chunked-encoded body from transport into a string buffer
-static int read_body_chunked(Transport *t, StrBuf *b) {
+// Read chunked-encoded body from transport into the sink
+static int read_body_chunked(Transport *t, BodySink *s) {
     char line[256];
     for (;;) {
-        if (!tp_read_line(t, line, sizeof(line))) return 0;
+        if (!tp_read_line(t, line, sizeof(line)))
+            return t->io_failed ? -1 : 0;
         uint64_t sz = url_http_chunk_size(line);
         if (sz == UINT64_MAX) return -1;
         if (sz == 0) {
@@ -1506,35 +1602,35 @@ static int read_body_chunked(Transport *t, StrBuf *b) {
             if (rem < want) want = (size_t)rem;
             int n = tp_read(t, buf, (int)want);
             if (n <= 0) {
-                if (t->eof) return 0;
-                return -1;
+                if (t->io_failed) return -1;
+                return 0;
             }
-            sb_append(b, buf, (size_t)n);
+            if (sink_append(s, buf, (size_t)n) != 0) return -1;
             rem -= (uint64_t)n;
         }
-        if (!tp_read_line(t, line, sizeof(line))) return 0;
+        if (!tp_read_line(t, line, sizeof(line)))
+            return t->io_failed ? -1 : 0;
     }
 }
 
-// Read body until EOF from transport into a string buffer
-static int read_body_to_eof(Transport *t, StrBuf *b) {
+// Read body until EOF from transport into the sink
+static int read_body_to_eof(Transport *t, BodySink *s) {
     char buf[16384];
     for (;;) {
         int n = tp_read(t, buf, (int)sizeof(buf));
-        if (n <= 0) break;
-        sb_append(b, buf, (size_t)n);
+        if (n <= 0) return t->io_failed ? -1 : 0;
+        if (sink_append(s, buf, (size_t)n) != 0) return -1;
     }
-    return 0;
 }
 
 // Read response body based on transfer encoding
-static int read_body(Transport *t, int is_head, const ResponseHead *rh, StrBuf *b) {
+static int read_body(Transport *t, int is_head, const ResponseHead *rh, BodySink *s) {
     if (is_head) return 0;
     const char *te = url_header_get(&rh->headers, "transfer-encoding");
     const char *cl = url_header_get(&rh->headers, "content-length");
-    if (te && strstr(te, "chunked")) return read_body_chunked(t, b);
-    if (cl) return read_body_fixed(t, strtoull(cl, NULL, 10), b);
-    return read_body_to_eof(t, b);
+    if (te && strstr(te, "chunked")) return read_body_chunked(t, s);
+    if (cl) return read_body_fixed(t, strtoull(cl, NULL, 10), s);
+    return read_body_to_eof(t, s);
 }
 
 // Serialize a parsed response head back to its HTTP/1.1 wire form
@@ -1626,24 +1722,32 @@ const char *url_response_header(const UrlCtx *ctx, const char *name) {
 }
 
 /*
- * Perform the HTTP(S) request and return the response body as a malloc'ed
- * string. Returns NULL on failure and records the error in ctx->last_error.
- * Console output (verbose progress and error messages) is routed through the
- * optional log callback (NULL = no logging).
+ * Core of url_run() / url_download_file(): connect, TLS handshake, send the
+ * request, read the response and route the body of the final response either
+ * into the in-memory buffer `out` (file_path == NULL) or into the local file
+ * `file_path`. Returns 0 on success, -1 on failure (ctx->last_error then
+ * holds a URL_ERR_* code). When file_path is set: a body with a known size of
+ * at most URL_STREAM_THRESHOLD is fetched the classic in-memory way and then
+ * written to disk; a larger or size-unknown (chunked) body is streamed to
+ * the file chunk by chunk (per-chunk I/O limits, never a transfer-wide
+ * deadline). An existing file is replaced; with a Range header (url_set_
+ * range) and a 206 response the received part is appended (resume).
  */
-char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
-    if (!ctx || !url || !method) return NULL;
+static int url_xfer(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log,
+                    const char *file_path, StrBuf *out, size_t *bytes_written) {
+    if (!ctx || !url || !method) return -1;
 
     ctx->last_status = 0;
     ctx->last_error = 0;
     memset(&ctx->last_head, 0, sizeof(ctx->last_head));
     ctx->result_len = 0;
+    if (bytes_written) *bytes_written = 0;
 
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         ctx->last_error = URL_ERR_INIT;
-        return NULL;
+        return -1;
     }
 #endif
     long io_timeout = ctx->connect_timeout_set ? ctx->connect_timeout_ms : 10000;
@@ -1661,8 +1765,6 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
     int failed = 0;
     int use_body = (ctx->data != NULL && ctx->data_len > 0);
     UrlInfo u;
-    StrBuf out;
-    sb_init(&out);
 
     for (;;) {
         if (url_parse(current_url, &u) != 0) {
@@ -1697,6 +1799,16 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
         memset(&tr, 0, sizeof(tr));
         tr.sock = sock;
         tr.is_ssl = u.is_ssl;
+        tr.io_timeout_ms = (int)io_timeout;
+        {
+            /* Idle gap between received bytes: 3 per-operation windows,
+             * clamped to 15..60 seconds. Bounds dead links, not transfers. */
+            int idle = io_timeout > 0 ? (int)io_timeout * 3 : 60000;
+            if (idle < 15000) idle = 15000;
+            if (idle > 60000) idle = 60000;
+            tr.idle_limit_ms = idle;
+        }
+        tr.last_data_tick = net_tick();
 
         if (u.is_ssl) {
 #if URL_LOGGING
@@ -1778,19 +1890,105 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
         }
 
         int is_head = (strcmp(method, "HEAD") == 0);
-        StrBuf body_buf;
-        sb_init(&body_buf);
+        const char *loc = NULL;
+        int is_redir = 0;
+        if (ctx->follow_redirects && rh.status >= 300 && rh.status < 400) {
+            loc = url_header_get(&rh.headers, "location");
+            if (loc && *loc) is_redir = 1;
+        }
+
         if (!is_head && rh.status != 204 && rh.status != 304) {
-            if (read_body(&tr, is_head, &rh, &body_buf) != 0) {
+            BodySink s;
+            StrBuf body_buf;
+            memset(&s, 0, sizeof(s));
+            sb_init(&body_buf);
+            int read_err = 0;
+            uint64_t clv = 0;
+
+            if (is_redir) {
+                /* The body of a redirect hop is scratch data, discarded. */
+                s.mem = &body_buf;
+                read_err = read_body(&tr, is_head, &rh, &s);
+            } else if (file_path) {
+                const char *clh = url_header_get(&rh.headers, "content-length");
+                const char *teh = url_header_get(&rh.headers, "transfer-encoding");
+                if (clh && !(teh && strstr(teh, "chunked")))
+                    clv = strtoull(clh, NULL, 10);
+                int stream = (clv == 0) || (clv > (uint64_t)URL_STREAM_THRESHOLD);
+                FILE *ff = fopen(file_path, "a+b");
+                if (!ff) {
+#if URL_LOGGING
+                    if (!ctx->silent && log) log("curl: (23) failed to open file '%s'\n", file_path);
+#endif
+                    ctx->last_error = URL_ERR_WRITE_FILE;
+                    sb_free(&body_buf);
+                    close_transport(&tr);
+                    failed = 1;
+                    break;
+                }
+                if (rh.status == 200 && file_truncate_to_zero(ff) != 0) {
+#if URL_LOGGING
+                    if (!ctx->silent && log) log("curl: (23) failed to truncate file '%s'\n", file_path);
+#endif
+                    ctx->last_error = URL_ERR_WRITE_FILE;
+                    fclose(ff);
+                    sb_free(&body_buf);
+                    close_transport(&tr);
+                    failed = 1;
+                    break;
+                }
+                /* 206: keep the existing part, the new bytes are appended */
+                if (stream) {
+                    /* Large / unknown size: stream to disk chunk by chunk.
+                     * Each chunk's read carries its own fresh timeout
+                     * window (see tp_fill); nothing limits the transfer
+                     * as a whole. */
+                    s.to_file = 1;
+                    s.f = ff;
+                    s.total = clv;
+                    s.log = log;
+                    s.verbose = ctx->verbose;
+                    read_err = read_body(&tr, is_head, &rh, &s);
+                } else {
+                    /* Small known size: the classic in-memory path, then
+                     * the buffer goes to disk in one write. */
+                    s.mem = &body_buf;
+                    read_err = read_body(&tr, is_head, &rh, &s);
+                    if (read_err == 0 && body_buf.len > 0 &&
+                        fwrite(body_buf.s, 1, body_buf.len, ff) != body_buf.len)
+                        read_err = -1;
+                }
+                fclose(ff);
+                if (read_err == 0 && clv > 0 && (uint64_t)s.written != clv)
+                    read_err = -1; /* truncated transfer */
+                if (read_err == 0 && bytes_written)
+                    *bytes_written = s.written;
+            } else {
+                /* url_run: the classic in-memory destination. */
+                s.mem = &body_buf;
+                read_err = read_body(&tr, is_head, &rh, &s);
+            }
+
+            if (read_err != 0) {
 #if URL_LOGGING
                 if (!ctx->silent && log) log("curl: (18) failed to read response body\n");
 #endif
+                ctx->last_error = URL_ERR_READ_BODY;
+                sb_free(&body_buf);
+                close_transport(&tr);
+                failed = 1;
+                break;
             }
-        }
 
-        const char *loc = NULL;
-        if (ctx->follow_redirects && rh.status >= 300 && rh.status < 400)
-            loc = url_header_get(&rh.headers, "location");
+            if (!is_redir && !file_path && out) {
+                /* Final response: prepend the head if requested, then body. */
+                if (ctx->include_headers)
+                    append_response_head(out, &rh);
+                if (body_buf.len > 0)
+                    sb_append(out, body_buf.s, body_buf.len);
+            }
+            sb_free(&body_buf);
+        }
 
         if (loc && *loc) {
             if (redirs >= ctx->max_redirs) {
@@ -1799,7 +1997,6 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
                     log("curl: (47) Maximum (%d) redirects followed\n", ctx->max_redirs);
 #endif
                 ctx->last_error = URL_ERR_MAX_REDIR;
-                sb_free(&body_buf);
                 close_transport(&tr);
                 failed = 1;
                 break;
@@ -1818,18 +2015,10 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
             }
 
             close_transport(&tr);
-            sb_free(&body_buf);
             u_strcpyz(current_url, sizeof(current_url), next);
             redirs++;
             continue;
         }
-
-        // Final response: prepend the head if requested, then the body.
-        if (ctx->include_headers)
-            append_response_head(&out, &rh);
-        if (body_buf.len > 0)
-            sb_append(&out, body_buf.s, body_buf.len);
-        sb_free(&body_buf);
 
         close_transport(&tr);
         break;
@@ -1838,7 +2027,20 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
 #ifdef _WIN32
     WSACleanup();
 #endif
-    if (failed) {
+    return failed ? -1 : 0;
+}
+
+/*
+ * Perform the HTTP(S) request and return the response body as a malloc'ed
+ * string. Returns NULL on failure and records the error in ctx->last_error.
+ * Console output (verbose progress and error messages) is routed through the
+ * optional log callback (NULL = no logging).
+ */
+char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
+    if (!ctx || !url || !method) return NULL;
+    StrBuf out;
+    sb_init(&out);
+    if (url_xfer(ctx, url, method, log, NULL, &out, NULL) != 0) {
         sb_free(&out);
         return NULL;
     }
@@ -1850,4 +2052,18 @@ char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log) {
     }
     ctx->result_len = out.len;
     return out.s;
+}
+
+/*
+ * Download a URL and save the response body to a local file (never to the
+ * console). See url_download_file() in url.h for the full contract.
+ */
+int url_download_file(UrlCtx *ctx, const char *url, const char *path, UrlLogFn log,
+                      size_t *bytes_out) {
+    if (!ctx || !url || !path || !path[0]) return -1;
+    size_t w = 0;
+    if (url_xfer(ctx, url, "GET", log, path, NULL, &w) != 0)
+        return -1;
+    if (bytes_out) *bytes_out = w;
+    return 0;
 }

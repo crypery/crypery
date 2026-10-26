@@ -21,6 +21,16 @@
  *     url_set_content_type(ctx, "application/x-www-form-urlencoded");
  *     char *data = url_run(ctx, "https://example.com", "POST", NULL);
  *     if (data) { printf("%s", data); free(data); }
+ *
+ *     // Download a large file straight to disk (never to the console):
+ *     // bodies up to 10 MB use the classic in-memory path, larger (or
+ *     // size-unknown / chunked) bodies are streamed to the file chunk by
+ *     // chunk - I/O limits apply per chunk, so long downloads keep running
+ *     // as long as data keeps arriving.
+ *     size_t saved = 0;
+ *     url_download_file(ctx, "https://example.com/model.bin",
+ *                       "model.bin", NULL, &saved);
+ *
  *     url_free(ctx);
  *
  * All public functions are prefixed with url_ (never url_url_...). The buffer
@@ -68,6 +78,7 @@ extern "C" {
 #define URL_ERR_MAX_REDIR     47   // too many redirects followed
 #define URL_ERR_SEND          55   // failed to send the request
 #define URL_ERR_RECV          56   // no HTTP response received
+#define URL_ERR_WRITE_FILE    23   // failed to open/write the output file
 #define URL_ERR_BUILD_REQUEST 98   // failed to build the request
 
 /* Compile-time switch: define URL_NO_LOG before including url.h (e.g. with
@@ -204,6 +215,36 @@ typedef void (*UrlLogFn)(const char *fmt, ...);
  *         buffer. The byte length is stored in ctx->result_len.
  */
 char *url_run(UrlCtx *ctx, const char *url, const char *method, UrlLogFn log);
+
+/* Download a URL and save the response body to a local file (never to the
+ * console). Performs a GET request with the context parameters (headers,
+ * redirects, timeouts, Range) and stores the response body at `path`:
+ *  - a body with a known size of at most 10 MB is fetched the classic way
+ *    (into memory, exactly as url_run does) and written to the file;
+ *  - a larger, size-unknown or chunked body is streamed to disk chunk by
+ *    chunk, so multi-gigabyte files do not need to fit in RAM.
+ *
+ * I/O limits apply to the chunks, not to the connection as a whole: every
+ * read operation gets a fresh timeout window (io_timeout) and the transfer
+ * is retried while the data-less gap stays below a bounded idle limit
+ * (15..60 s), so a long download runs as long as data keeps arriving and
+ * only a silent (dead) link fails.
+ *
+ * An existing file is replaced; with a Range header set (url_set_range) and
+ * a 206 response the received part is appended to the existing file
+ * (resume). When ctx->verbose is set, throttled progress lines are routed
+ * through the log callback.
+ *
+ * @param ctx       Request context (created by url_init()); must not be NULL.
+ * @param url       Absolute URL to download; must not be NULL.
+ * @param path      Local file path to write to; must not be NULL or empty.
+ * @param log       Log callback (same semantics as url_run); NULL disables it.
+ * @param bytes_out Optional; receives the number of bytes written to the file.
+ * @return 0 on success, -1 on failure (ctx->last_error then holds a URL_ERR_*
+ *         code, e.g. URL_ERR_WRITE_FILE for disk errors).
+ */
+int url_download_file(UrlCtx *ctx, const char *url, const char *path, UrlLogFn log,
+                      size_t *bytes_out);
 
 // --- request parameter helpers ---
 

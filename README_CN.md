@@ -63,7 +63,7 @@
 自包含的 HTTP/1.1 服务器库，构建于内置 TLS 协议栈之上：
 
 - 按方法和路径进行请求路由，支持自定义处理器；
-- 从根目录分发静态文件，自动识别 MIME 类型；
+- 从根目录分发静态文件，自动识别 MIME 类型：10 MB 以内的文件整体读入内存，更大的文件按块流式发送给客户端（每个连接持有自己的 `FILE*`，文件永不加锁；I/O 限制作用于已发送的数据块，而非整条传输）；
 - gzip 压缩：分发预压缩的 `.gz` 文件以及通过 zlib 实时压缩（可通过 `HTTP_NO_GZIP` 关闭）；
 - WebSocket（RFC 6455）：连接升级、帧的读取与发送（文本、二进制、close、ping/pong）；
 - Server-Sent Events（SSE）；
@@ -83,6 +83,7 @@
 - 读取响应：状态行、请求头、按 Content-Length、chunked transfer encoding 或直到 EOF 读取响应体；
 - 重定向处理（301/302/303/307/308），遵循 RFC 7231 的方法语义，并限制跳转次数；
 - 构建 multipart/form-data 请求体（字段和文件、boundary 生成、按扩展名识别 MIME）；
+- 通过 `url_download_file()` 将文件下载到磁盘：10 MB 以内的响应体按经典方式读入内存再写入文件，更大的（或大小未知 / chunked）响应体按块流式写盘——I/O 限制作用于每个收到的数据块（每次读取都有全新的超时窗口），而非整个连接，因此只要数据持续到达，长时下载就不会中断；通过 Range/206 断点续传时会追加写入已有文件；
 - Cookie 存储：所有 `UrlCtx` 共享一个内存 Cookie 列表，可选持久化到文件（`ctx->use_cook` / `ctx->cook_file`）；按 RFC 6265 规则匹配（Domain/Path、Secure 仅限 TLS、Max-Age/Expires），自动存储 `Set-Cookie` 并在 GET 请求中发送 `Cookie`；
 - 传输层：DNS 解析、带超时的连接、TLS 握手（SNI、可选跳过证书校验）、缓冲读写；
 - 与 curl 约定兼容的错误码；
@@ -212,7 +213,7 @@ int main(void)
 }
 ```
 
-对未注册路由的路径的请求，会自动由请求 `Host` 域对应的根目录下的静态文件分发处理（见 `http_domain()`）；未配置任何域时则所有主机都使用内置的默认根目录 `DEF_ROOT`（`www`）。路由按域单独注册：`http_route(http, domain, method, path, handler)` 仅对该域生效，`domain` 传 `NULL` 时对所有域生效。
+对未注册路由的路径的请求，会自动由请求 `Host` 域对应的根目录下的静态文件分发处理（见 `http_domain()`）；未配置任何域时则所有主机都使用内置的默认根目录 `DEF_ROOT`（`www`）。路由按域单独注册：`http_route(http, domain, method, path, handler)` 仅对该域生效，`domain` 传 `NULL` 时对所有域生效。10 MB 以内的静态文件读入内存后一次性发送；更大的文件按块流式发送给客户端（I/O 限制作用于已发送的数据块，而非整条传输），且每个连接持有自己的 `FILE*`，文件永不加锁——多个客户端可以同时下载。
 
 ### url
 
@@ -236,6 +237,28 @@ if (data) {
     free(data);                            /* 缓冲区由 url_run() 分配 */
 } else {
     printf("error: %d\n", ctx->last_error);
+}
+url_free(ctx);
+```
+
+下载大文件到磁盘（绝不输出到控制台）：
+
+```c
+#include "url.h"
+
+UrlCtx *ctx = url_init();
+ctx->follow_redirects = 1;                 /* CDN 通常会有重定向 */
+
+size_t saved = 0;
+if (url_download_file(ctx, "https://example.com/model.bin",
+                      "model.bin", NULL, &saved) == 0) {
+    /* 10 MB 以内的响应体走经典路径（读入内存），更大的（或大小未知 /
+     * chunked）响应体按块流式写入 "model.bin"。
+     * 设置了 Range（url_set_range）且响应为 206 时，收到的数据会追加
+     * 写入已有文件（断点续传）。 */
+    printf("saved %zu bytes (status %d)\n", saved, url_status(ctx));
+} else {
+    printf("error: %d\n", ctx->last_error); /* URL_ERR_* 错误码 */
 }
 url_free(ctx);
 ```

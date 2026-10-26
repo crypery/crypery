@@ -63,7 +63,7 @@ An OpenSSL-compatible API layer over the built-in TLS implementation. Designed s
 A self-contained HTTP/1.1 server library built on the built-in TLS stack:
 
 - request routing by method and path with user-defined handlers;
-- static file serving from a root directory with MIME type detection;
+- static file serving from a root directory with MIME type detection: files up to 10 MB are read fully into memory, larger files are streamed to the client chunk by chunk (each connection keeps its own `FILE*`, the file is never locked; I/O limits apply per sent chunk, never to the transfer as a whole);
 - gzip compression: serving pre-compressed `.gz` files and on-the-fly compression via zlib (disabled by `HTTP_NO_GZIP`);
 - WebSocket (RFC 6455): connection upgrade, reading and sending frames (text, binary, close, ping/pong);
 - Server-Sent Events (SSE);
@@ -83,6 +83,7 @@ A self-contained HTTP/HTTPS client library built on the built-in TLS stack:
 - response reading: status line, headers, body by Content-Length, chunked transfer encoding, or until EOF;
 - redirect handling (301/302/303/307/308) with RFC 7231 method semantics and a redirect count limit;
 - multipart/form-data body building (fields and files, boundary generation, MIME detection by extension);
+- file downloads to disk via `url_download_file()`: bodies up to 10 MB are fetched the classic way (into memory) and written to the file, larger (or size-unknown / chunked) bodies are streamed to disk chunk by chunk - I/O limits apply per received chunk (a fresh timeout window per read operation), never to the connection as a whole, so long downloads keep running as long as data keeps arriving; resume via Range/206 appends to the existing file;
 - cookie jar: one in-memory list shared by every `UrlCtx` with optional persistence to a file (`ctx->use_cook` / `ctx->cook_file`); RFC 6265-style matching (Domain/Path, Secure over TLS only, Max-Age/Expires), automatic `Set-Cookie` storage and `Cookie` sending on GET;
 - transport layer: DNS resolution, connection with timeout, TLS handshake (SNI, option to skip certificate verification), buffered I/O;
 - error codes compatible with curl conventions;
@@ -224,7 +225,7 @@ int main(void)
 }
 ```
 
-Requests to paths without registered routes are automatically served by static file serving from the document root of the request's `Host` domain (see `http_domain()`); when no domains are configured every host is served from the built-in default root `DEF_ROOT` (`www`). Routes are registered per domain: `http_route(http, domain, method, path, handler)` applies only to that domain, or to every domain when the domain argument is `NULL`.
+Requests to paths without registered routes are automatically served by static file serving from the document root of the request's `Host` domain (see `http_domain()`); when no domains are configured every host is served from the built-in default root `DEF_ROOT` (`www`). Routes are registered per domain: `http_route(http, domain, method, path, handler)` applies only to that domain, or to every domain when the domain argument is `NULL`. Static files up to 10 MB are read into memory and sent in one response; larger files are streamed to the client chunk by chunk (the I/O limits apply per sent chunk, never to the transfer as a whole), and because every connection keeps its own `FILE*` the file is never locked - several clients can download it at once.
 
 ### url
 
@@ -251,6 +252,28 @@ if (data) {
     free(data);                            /* buffer is allocated by url_run() */
 } else {
     printf("error: %d\n", ctx->last_error);
+}
+url_free(ctx);
+```
+
+Downloading a large file to disk (never to the console):
+
+```c
+#include "url.h"
+
+UrlCtx *ctx = url_init();
+ctx->follow_redirects = 1;                 /* CDNs usually redirect */
+
+size_t saved = 0;
+if (url_download_file(ctx, "https://example.com/model.bin",
+                      "model.bin", NULL, &saved) == 0) {
+    /* Bodies up to 10 MB go through the classic in-memory path, larger (or
+     * size-unknown / chunked) ones are streamed to "model.bin" chunk by
+     * chunk. With a Range header set (url_set_range) and a 206 response
+     * the received part is appended to the existing file (resume). */
+    printf("saved %zu bytes (status %d)\n", saved, url_status(ctx));
+} else {
+    printf("error: %d\n", ctx->last_error); /* URL_ERR_* code */
 }
 url_free(ctx);
 ```

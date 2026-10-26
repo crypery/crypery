@@ -45,6 +45,14 @@ static const char *http_ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 // Hard safety cap for request bodies when max_body_mb is 0 (unlimited)
 #define HTTP_HARD_MAX_BODY (256 * 1024 * 1024)
 
+// Static files up to this size keep the classic in-memory response
+// (whole file read, sent right after the headers).
+#define HTTP_STREAM_THRESHOLD (10 * 1024 * 1024)
+// Chunk size for the large-file streaming path (read part -> send part).
+#define HTTP_STREAM_CHUNK (64 * 1024)
+// Hard cap for static files (ftell() is a 32-bit long on Windows).
+#define HTTP_MAX_FILE (2047 * 1024 * 1024)
+
 // SHA-1 working state (5 x 32-bit words)
 typedef struct { uint32_t h[5]; } http_sha1_ctx_t;
 
@@ -1083,6 +1091,69 @@ const char *http_mime_type(const char *p) {
     return "application/octet-stream";
 }
 
+/* Send data through the socket and report how many bytes went out.
+ * Returns len on success, less than len (or -1) when the peer went away
+ * mid-transfer. */
+static int resp_send_n(http_ctx_t *c, const void *data, size_t len) {
+    if (!c || !data || len == 0 || (int)c->fd <= 0) return -1;
+    if (c->is_https && c->_ssl) return SSL_write((SSL *)c->_ssl, data, (int)len);
+    return http_sock_send_all(c->fd, (const char *)data, (int)len, c->timeout_io_ms);
+}
+
+/* Stream an open file to the client in read-chunk -> send-chunk steps.
+ * Every I/O operation gets a fresh timeout window (timeout_io_ms), so the
+ * limits apply to each sent chunk, not to the whole transfer: as long as
+ * the client keeps draining, the download may run as long as needed.
+ * Returns 1 when the whole file was sent, 0 when the client went away. */
+static int http_stream_file(http_ctx_t *c, FILE *f) {
+    char buf[HTTP_STREAM_CHUNK];
+    for (;;) {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        if (n == 0) break;
+        if (resp_send_n(c, buf, n) != (int)n) return 0;
+    }
+    return 1;
+}
+
+/* Build the 200 OK header block for a static file. */
+static int http_file_headers(http_ctx_t *c, long fl, const char *rel, int is_gz,
+                             char *h, size_t hs) {
+    char db[128];
+    http_date_gmt(db, sizeof(db));
+    return snprintf(h, hs,
+        "HTTP/1.1 200 OK\r\nServer: %s\r\nDate: %s\r\n"
+        "Content-Type: %s%s\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
+        http_srv_name(c), db, http_mime_type(rel),
+        is_gz ? "\r\nContent-Encoding: gzip" : "", fl);
+}
+
+/* Serve an already-opened static file (the caller closes it).
+ * Up to HTTP_STREAM_THRESHOLD: classic path - the whole file is read into
+ * memory and sent right after the headers (unchanged behavior).
+ * Above the threshold: streamed - headers first, then read-a-chunk ->
+ * send-a-chunk until EOF. Each connection keeps its own FILE* (opened in
+ * the caller), so the file is never locked and many clients can download
+ * it at once. The I/O limits apply per sent chunk, not to the connection
+ * as a whole. Returns 1 when the file was fully served, 0 when the client
+ * disconnected before the end. */
+static int http_serve_open_file(http_ctx_t *c, FILE *f, long fl, const char *rel, int is_gz) {
+    if (!c || !f || fl <= 0) return 0;
+    char h[400];
+    int hl = http_file_headers(c, fl, rel, is_gz, h, sizeof(h));
+    if (hl <= 0 || (size_t)hl >= sizeof(h)) return 0;
+    if ((size_t)fl <= HTTP_STREAM_THRESHOLD) {
+        char *b = (char *)malloc((size_t)fl + 1);
+        if (!b) return 0;
+        size_t nr = fread(b, 1, (size_t)fl, f);
+        resp_send(c, h, (size_t)hl);
+        resp_send(c, b, nr);
+        free(b);
+        return 1;
+    }
+    if (resp_send_n(c, h, (size_t)hl) != hl) return 0;
+    return http_stream_file(c, f);
+}
+
 #ifndef HTTP_NO_GZIP
 
 // Serve a pre-compressed.gz file if the client accepts gzip
@@ -1189,6 +1260,14 @@ void http_sfile(http_server_t *http, http_ctx_t *c, const char *rel) {
     }
     fseek(f, 0, SEEK_END); long fl = ftell(f); fseek(f, 0, SEEK_SET);
     if (fl <= 0 || fl > 100 * 1024 * 1024) { fclose(f); return; }
+    if ((size_t)fl > HTTP_STREAM_THRESHOLD) {
+        /* Large file: do not load it into the write buffer; stream it
+         * straight to the socket (headers + read-chunk/send-chunk loop). */
+        int ok = http_serve_open_file(c, f, fl, rel, 0);
+        fclose(f);
+        (void)ok;
+        return;
+    }
     char *b = (char *)malloc((size_t)fl + 1); size_t nr = fread(b, 1, (size_t)fl, f); fclose(f);
     char db[128];
     http_date_gmt(db, sizeof(db));
@@ -1467,8 +1546,19 @@ int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
         resp_send(c, h, (size_t)hl); http_update_status_stats(http, 404); return 1;
     }
     fseek(f, 0, SEEK_END); long fl = ftell(f); fseek(f, 0, SEEK_SET);
-    if (fl <= 0 || fl > 100 * 1024 * 1024) { fclose(f); return 1; }
+    if (fl <= 0) { fclose(f); return 1; }
+    if (fl > HTTP_MAX_FILE) {
+        /* Beyond what ftell() (32-bit long) can even report reliably. */
+        char h[300]; int hl = snprintf(h, sizeof(h),
+            "HTTP/1.1 500 Internal Server Error\r\nServer: %s\r\n"
+            "Content-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+            "<!DOCTYPE html><html><head><title>500</title></head><body><h1>File too large</h1></body></html>",
+            http_srv_name(c));
+        resp_send(c, h, (size_t)hl); fclose(f); http_update_status_stats(http, 500); return 1;
+    }
 #ifndef HTTP_NO_GZIP
+    /* A pre-compressed .gz variant wins when the client accepts gzip; it is
+     * served through the same size rules (streamed above the threshold). */
     int gz_served = 0;
     const char *ae = NULL;
     {
@@ -1484,43 +1574,23 @@ int http_dispatch_handler(http_server_t *http, http_ctx_t *c) {
             FILE *gf = fopen(gz_path, "rb");
             if (gf) {
                 fseek(gf, 0, SEEK_END); long gs = ftell(gf); fseek(gf, 0, SEEK_SET);
-                if (gs > 0 && gs < 100 * 1024 * 1024) {
-                    char *gz_d = (char *)malloc((size_t)gs + 1);
-                    size_t gz_r = fread(gz_d, 1, (size_t)gs, gf); fclose(gf);
-                    if ((long)gz_r == gs) {
-                        char db[128];
-                        http_date_gmt(db, sizeof(db));
-                        const char *mt = http_mime_type(rel);
-                        char h[400]; int hl = snprintf(h, sizeof(h),
-                            "HTTP/1.1 200 OK\r\nServer: %s\r\nDate: %s\r\n"
-                            "Content-Type: %s\r\nContent-Encoding: gzip\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
-                            http_srv_name(c), db, mt, gs);
-                        resp_send(c, h, (size_t)hl);
-                        resp_send(c, gz_d, (size_t)gz_r);
-                        gz_served = 1;
-                        free(gz_d);
-                    }
-                } else { fclose(gf); }
+                if (gs > 0 && gs <= HTTP_MAX_FILE) gz_served = http_serve_open_file(c, gf, gs, rel, 1);
+                fclose(gf);
             }
         }
     }
-    if (!gz_served) {
-#else
-    {
-#endif
-        char *b = (char *)malloc((size_t)fl + 1); size_t nr = fread(b, 1, (size_t)fl, f); fclose(f);
-        char db[128];
-        http_date_gmt(db, sizeof(db));
-        char h[300]; int hl = snprintf(h, sizeof(h),
-            "HTTP/1.1 200 OK\r\nServer: %s\r\nDate: %s\r\n"
-            "Content-Type: %s\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
-            http_srv_name(c), db, http_mime_type(rel), fl);
-        resp_send(c, h, (size_t)hl);
-        resp_send(c, b, nr);
-        free(b);
+    if (gz_served) {
+        fclose(f);
+        http_update_status_stats(http, 200);
+        return 1;
     }
-    http_update_status_stats(http, 200);
-    return 1;
+#endif
+    {
+        int ok = http_serve_open_file(c, f, fl, rel, 0);
+        fclose(f);
+        if (ok) http_update_status_stats(http, 200);
+        return 1;
+    }
 }
 
 /* Read up to len bytes from a connection (TLS-aware).

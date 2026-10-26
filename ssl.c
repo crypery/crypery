@@ -695,9 +695,16 @@ int SSL_write(SSL *ssl, const void *buf, int len) {
         if (ret != 0) return -1;
     }
 
-    // Check if this is already a TLS record (starts with type 0x14-0x17)
+    // Check if this is a complete, well-formed TLS record: type 0x14-0x17,
+    // a valid version field and a record length that covers the whole
+    // buffer. Plain binary payloads (e.g. file chunks) can start with
+    // 0x14-0x17 by chance; without the length check they would be
+    // forwarded unencrypted and corrupt the TLS stream.
     const uint8_t *data = (const uint8_t*)buf;
-    if (len >= 5 && data[0] >= 0x14 && data[0] <= 0x17) {
+    int raw_record = (len >= 5 && data[0] >= 0x14 && data[0] <= 0x17 &&
+                      data[1] == 0x03 && data[2] <= 0x04 &&
+                      (int)(((unsigned)data[3] << 8) | (unsigned)data[4]) == (int)len - 5);
+    if (raw_record) {
         // Already a TLS record - send directly
         int total_sent = 0;
         while (total_sent < len) {
